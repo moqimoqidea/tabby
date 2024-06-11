@@ -5373,7 +5373,6 @@ dependencies = [
  "tabby-schema",
  "tarpc",
  "temp_testdir",
- "thiserror",
  "tokio",
  "tokio-tungstenite",
  "tracing",
