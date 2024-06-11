@@ -23,8 +23,14 @@ pub async fn fetch_all_gitlab_repos(
     let base_url = api_base.strip_prefix("https://").unwrap_or(api_base);
     let mut builder = GitlabBuilder::new(base_url, access_token);
 
+    let mut cert_dir = std::env::var("SSL_CERT_DIR").ok();
+
     if cfg!(target_family = "unix") {
-        let mut read_dir = tokio::fs::read_dir("/etc/ssl/certs").await?;
+        cert_dir.get_or_insert("/etc/ssl/certs".into());
+        cert_dir.replace("/etc/ssl/certs".into());
+    }
+    if let Some(cert_dir) = cert_dir {
+        let mut read_dir = tokio::fs::read_dir(cert_dir).await?;
         while let Some(cert) = read_dir.next_entry().await? {
             let path = cert.path();
             if !path.ends_with(".pem") {
