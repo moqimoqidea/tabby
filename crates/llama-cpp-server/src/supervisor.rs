@@ -50,12 +50,15 @@ impl LlamaCppSupervisor {
                     .arg(port.to_string())
                     .arg("-np")
                     .arg(parallelism.to_string())
-                    .arg("--log-disable")
                     .arg("--ctx-size")
                     .arg(env::var("LLAMA_CPP_N_CONTEXT_SIZE").unwrap_or("4096".into()))
                     .kill_on_drop(true)
                     .stderr(Stdio::piped())
                     .stdout(Stdio::null());
+
+                if var("LLAMA_CPP_LOGGING_ENABLED").unwrap_or_else(|_| String::from("0")) != "1" {
+                    command.arg("--log-disable");
+                }
 
                 if let Ok(n_threads) = std::env::var("LLAMA_CPP_N_THREADS") {
                     command.arg("-t").arg(n_threads);
