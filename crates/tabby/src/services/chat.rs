@@ -37,6 +37,9 @@ pub struct ChatCompletionRequest {
 
     #[builder(default = "None")]
     presence_penalty: Option<f32>,
+
+    #[builder(default = "None")]
+    pub chat_template: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
@@ -108,6 +111,9 @@ impl ChatService {
             });
             request.presence_penalty.inspect(|x| {
                 builder.presence_penalty(*x);
+            });
+            request.chat_template.clone().inspect(|x| {
+                builder.chat_template(Some(x.clone()));
             });
             builder
                 .build()
