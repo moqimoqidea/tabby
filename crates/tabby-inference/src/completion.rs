@@ -14,6 +14,9 @@ pub struct CompletionOptions {
 
     #[builder(default = "0.0")]
     pub presence_penalty: f32,
+
+    #[builder(default = "None")]
+    pub chat_template: Option<String>,
 }
 
 #[async_trait]

@@ -10,6 +10,7 @@ use tabby_inference::{
     ChatCompletionOptions, ChatCompletionStream, CompletionOptionsBuilder, CompletionStream,
 };
 
+#[derive(Clone)]
 struct ChatPromptBuilder {
     env: Environment<'static>,
 }
@@ -54,9 +55,15 @@ impl ChatCompletionStream for ChatCompletionImpl {
             .max_decoding_tokens(options.max_decoding_tokens)
             .sampling_temperature(options.sampling_temperature)
             .presence_penalty(options.presence_penalty)
+            .chat_template(options.chat_template)
             .build()?;
 
-        let prompt = self.prompt_builder.build(messages)?;
+        let prompt_builder = match &options.chat_template {
+            Some(template) => ChatPromptBuilder::new(template.clone()),
+            None => self.prompt_builder.clone(),
+        };
+
+        let prompt = prompt_builder.build(messages)?;
 
         let s = stream! {
             for await content in self.engine.generate(&prompt, options).await {
