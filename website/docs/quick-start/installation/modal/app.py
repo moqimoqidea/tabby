@@ -2,7 +2,7 @@
 modal serve app.py
 """
 
-from modal import Image, Stub, asgi_app, gpu
+from modal import Image, App, asgi_app, gpu
 
 IMAGE_NAME = "tabbyml/tabby"
 MODEL_ID = "TabbyML/StarCoder-1B"
@@ -32,17 +32,17 @@ image = (
     .pip_install("asgi-proxy-lib")
 )
 
-stub = Stub("tabby-server-" + MODEL_ID.split("/")[-1], image=image)
+app = App("tabby-server-" + MODEL_ID.split("/")[-1], image=image)
 
 
-@stub.function(
+@app.function(
     gpu=GPU_CONFIG,
     allow_concurrent_inputs=10,
     container_idle_timeout=120,
     timeout=360,
 )
 @asgi_app()
-def app():
+def app_serve():
     import socket
     import subprocess
     import time
@@ -59,7 +59,7 @@ def app():
             "--device",
             "cuda",
             "--parallelism",
-            "4",
+            "1",
         ]
     )
 
