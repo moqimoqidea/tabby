@@ -2,7 +2,7 @@
 modal serve app.py
 """
 
-from modal import Image, App, asgi_app, gpu
+from modal import Image, App, asgi_app, gpu, Volume
 
 IMAGE_NAME = "tabbyml/tabby"
 MODEL_ID = "TabbyML/StarCoder-1B"
@@ -34,12 +34,17 @@ image = (
 
 app = App("tabby-server-" + MODEL_ID.split("/")[-1], image=image)
 
+data_ee_vol = Volume.from_name("data_ee", create_if_missing=True)
+data_ee_path = "/data/ee"
+
 
 @app.function(
     gpu=GPU_CONFIG,
     allow_concurrent_inputs=10,
     container_idle_timeout=120,
     timeout=360,
+    volumes={data_ee_path: data_ee_vol},
+    _allow_background_volume_commits=True
 )
 @asgi_app()
 def app_serve():
