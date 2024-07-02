@@ -6,7 +6,7 @@ from modal import Image, App, asgi_app, gpu, Volume
 
 IMAGE_NAME = "tabbyml/tabby"
 MODEL_ID = "TabbyML/StarCoder-1B"
-GPU_CONFIG = gpu.T4()
+GPU_CONFIG = gpu.L4()
 
 
 def download_model():
