@@ -40,7 +40,7 @@ image = (
 app = App("tabby-server-" + MODEL_ID.split("/")[-1], image=image)
 
 ee_volume = Volume.from_name("tabby-ee-vol", create_if_missing=True)
-ee_dir = "/root/.tabby/ee"
+ee_dir = "/data/ee"
 
 @app.function(
     gpu=GPU_CONFIG,
@@ -51,7 +51,7 @@ ee_dir = "/root/.tabby/ee"
     _allow_background_volume_commits=True,
 )
 @asgi_app()
-def app_serve_temp():
+def app_serve():
     import socket
     import subprocess
     import os
@@ -79,9 +79,6 @@ def app_serve_temp():
 
     # Poll until webserver at 127.0.0.1:8000 accepts connections before running inputs.
     def tabby_ready():
-        # Reload the volume to get the latest changes.
-        ee_volume.reload()
-
         try:
             socket.create_connection(("127.0.0.1", 8000), timeout=1).close()
             return True
