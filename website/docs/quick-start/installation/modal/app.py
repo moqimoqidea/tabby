@@ -39,7 +39,7 @@ image = (
 
 app = App("tabby-server-" + MODEL_ID.split("/")[-1], image=image)
 
-ee_volume = Volume.from_name("tabby-ee", create_if_missing=True)
+ee_volume = Volume.from_name("tabby-ee-vol", create_if_missing=True)
 ee_dir = "/root/.tabby/ee"
 
 @app.function(
@@ -79,15 +79,18 @@ def app_serve_temp():
 
     # Poll until webserver at 127.0.0.1:8000 accepts connections before running inputs.
     def tabby_ready():
+        # Reload the volume to get the latest changes.
+        ee_volume.reload()
+
         try:
             socket.create_connection(("127.0.0.1", 8000), timeout=1).close()
             return True
         except (socket.timeout, ConnectionRefusedError):
-            # Check if launcher webserving process has exited.
+            # Check if launcher webservice process has exited.
             # If so, a connection can never be made.
-            retcode = launcher.poll()
-            if retcode is not None:
-                raise RuntimeError(f"launcher exited unexpectedly with code {retcode}")
+            ret_code = launcher.poll()
+            if ret_code is not None:
+                raise RuntimeError(f"launcher exited unexpectedly with code {ret_code}")
             return False
 
     while not tabby_ready():
