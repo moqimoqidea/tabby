@@ -10,7 +10,7 @@ First we import the components we need from `modal`.
 from modal import Image, App, asgi_app, gpu, Volume
 ```
 
-Next, we set the base docker image version, which model to serve, taking care to specify the GPU configuration required to fit the model into VRAM.
+Next, we set the base Docker image version and specify which model to serve, using the `L4` GPU configuration to efficiently utilize VRAM.
 
 ```python
 IMAGE_NAME = "tabbyml/tabby"
@@ -49,14 +49,13 @@ def download_model():
     )
 ```
 
-
 ### Image definition
 
 We’ll start from an image by tabby, and override the default ENTRYPOINT for Modal to run its own which enables seamless serverless deployments.
 
-Next we run the download step to pre-populate the image with our model weights.
+Next, we run the download step to pre-populate the image with our model weights.
 
-Finally, we install the `asgi-proxy-lib` to interface with modal's asgi webserver over localhost.
+Finally, we install the `asgi-proxy-lib` to interface with Modal's ASGI webserver over localhost.
 
 ```python
 image = (
@@ -78,7 +77,7 @@ The endpoint function is represented with Modal's `@app.function`. Here, we:
 2. Create an ASGI proxy to tunnel requests from the Modal web endpoint to the local Tabby server.
 3. Specify that each container is allowed to handle up to 10 requests simultaneously.
 4. Keep idle containers for 2 minutes before spinning them down.
-5. Use Volume to store the "/data/ee" directory, which is used by Tabby to store its database.
+5. Use a Volume to efficiently manage the persistent storage of the "/data/ee" directory, crucial for housing Tabby's database.
 
 ```python
 app = App("tabby-server-" + MODEL_ID.split("/")[-1], image=image)
@@ -138,9 +137,9 @@ def app_serve():
 
 ### Serve the app
 
-Once we deploy this model with `modal serve app.py`, it will output the url of the web endpoint, in a form of `https://<USERNAME>--tabby-server-starcoder-1b-app-serve-dev.modal.run`.
+Once we deploy this model with `modal serve app.py`, it will output the URL of the web endpoint, in a form of `https://<USERNAME>--tabby-server-starcoder-1b-app-serve-dev.modal.run`.
 
 ![App Running](./app-running.png)
 
-Now it can be used as tabby server url in tabby editor extensions!
-See [app.py](https://github.com/TabbyML/tabby/blob/main/website/docs/quick-start/installation/modal/app.py) for the full code used in this tutorial. 
+Now it can be used as tabby server URL in Tabby editor extensions!
+See [app.py](https://github.com/TabbyML/tabby/blob/main/website/docs/quick-start/installation/modal/app.py) for the full code used in this tutorial.
