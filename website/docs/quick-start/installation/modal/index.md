@@ -7,7 +7,7 @@
 First we import the components we need from `modal`.
 
 ```python
-from modal import Image, Stub, asgi_app, gpu
+from modal import Image, App, asgi_app, gpu, Volume
 ```
 
 Next, we set the base docker image version, which model to serve, taking care to specify the GPU configuration required to fit the model into VRAM.
@@ -15,7 +15,7 @@ Next, we set the base docker image version, which model to serve, taking care to
 ```python
 IMAGE_NAME = "tabbyml/tabby"
 MODEL_ID = "TabbyML/StarCoder-1B"
-GPU_CONFIG = gpu.T4()
+GPU_CONFIG = gpu.L4()
 ```
 
 Currently supported GPUs in Modal:
@@ -23,6 +23,7 @@ Currently supported GPUs in Modal:
 - `T4`: Low-cost GPU option, providing 16GiB of GPU memory.
 - `L4`: Mid-tier GPU option, providing 24GiB of GPU memory.
 - `A100`: The most powerful GPU available in the cloud. Available in 40GiB and 80GiB GPU memory configurations.
+- `H100`: The flagship data center GPU of the Hopper architecture. Enhanced support for FP8 precision and a Transformer Engine that provides up to 4X faster training over the prior generation for GPT-3 (175B) models.
 - `A10G`: A10G GPUs deliver up to 3.3x better ML training performance, 3x better ML inference performance, and 3x better graphics performance, in comparison to NVIDIA T4 GPUs.
 - `Any`: Selects any one of the GPU classes available within Modal, according to availability.
 
@@ -71,23 +72,30 @@ image = (
 
 ### The app function
 
-The endpoint function is represented with Modal's `@stub.function`. Here, we:
+The endpoint function is represented with Modal's `@app.function`. Here, we:
 
 1. Launch the Tabby process and wait for it to be ready to accept requests.
 2. Create an ASGI proxy to tunnel requests from the Modal web endpoint to the local Tabby server.
 3. Specify that each container is allowed to handle up to 10 requests simultaneously.
 4. Keep idle containers for 2 minutes before spinning them down.
+5. Use Volume to store the "/data/ee" directory, which is used by Tabby to store its database.
 
 ```python
-stub = Stub("tabby-server-" + MODEL_ID.split("/")[-1], image=image)
-@stub.function(
+app = App("tabby-server-" + MODEL_ID.split("/")[-1], image=image)
+
+ee_volume = Volume.from_name("tabby-ee-vol", create_if_missing=True)
+ee_dir = "/data/ee"
+
+@app.function(
     gpu=GPU_CONFIG,
     allow_concurrent_inputs=10,
     container_idle_timeout=120,
     timeout=360,
+    volumes={ee_dir: ee_volume},
+    _allow_background_volume_commits=True,
 )
 @asgi_app()
-def app():
+def app_serve():
     import socket
     import subprocess
     import time
@@ -103,6 +111,8 @@ def app():
             "8000",
             "--device",
             "cuda",
+            "--parallelism",
+            "4",
         ]
     )
 
@@ -112,11 +122,11 @@ def app():
             socket.create_connection(("127.0.0.1", 8000), timeout=1).close()
             return True
         except (socket.timeout, ConnectionRefusedError):
-            # Check if launcher webserving process has exited.
+            # Check if launcher webservice process has exited.
             # If so, a connection can never be made.
-            retcode = launcher.poll()
-            if retcode is not None:
-                raise RuntimeError(f"launcher exited unexpectedly with code {retcode}")
+            ret_code = launcher.poll()
+            if ret_code is not None:
+                raise RuntimeError(f"launcher exited unexpectedly with code {ret_code}")
             return False
 
     while not tabby_ready():
@@ -128,9 +138,9 @@ def app():
 
 ### Serve the app
 
-Once we deploy this model with `modal serve app.py`, it will output the url of the web endpoint, in a form of `https://<USERNAME>--tabby-server-starcoder-1b-app-dev.modal.run`.
+Once we deploy this model with `modal serve app.py`, it will output the url of the web endpoint, in a form of `https://<USERNAME>--tabby-server-starcoder-1b-app-serve-dev.modal.run`.
 
 ![App Running](./app-running.png)
 
 Now it can be used as tabby server url in tabby editor extensions!
-See [app.py](https://github.com/TabbyML/tabby/blob/main/website/docs/installation/modal/app.py) for the full code used in this tutorial. 
+See [app.py](https://github.com/TabbyML/tabby/blob/main/website/docs/quick-start/installation/modal/app.py) for the full code used in this tutorial. 
