@@ -2,11 +2,11 @@
 modal serve app.py
 """
 
-from modal import Image, Stub, asgi_app, gpu
+from modal import Image, App, asgi_app, gpu, Volume
 
 IMAGE_NAME = "tabbyml/tabby"
 MODEL_ID = "TabbyML/StarCoder-1B"
-GPU_CONFIG = gpu.T4()
+GPU_CONFIG = gpu.L4()
 
 
 def download_model():
@@ -32,17 +32,21 @@ image = (
     .pip_install("asgi-proxy-lib")
 )
 
-stub = Stub("tabby-server-" + MODEL_ID.split("/")[-1], image=image)
+app = App("tabby-server-" + MODEL_ID.split("/")[-1], image=image)
 
+ee_volume = Volume.from_name("tabby-ee-vol", create_if_missing=True)
+ee_dir = "/data/ee"
 
-@stub.function(
+@app.function(
     gpu=GPU_CONFIG,
     allow_concurrent_inputs=10,
     container_idle_timeout=120,
     timeout=360,
+    volumes={ee_dir: ee_volume},
+    _allow_background_volume_commits=True,
 )
 @asgi_app()
-def app():
+def app_serve():
     import socket
     import subprocess
     import time
@@ -69,11 +73,11 @@ def app():
             socket.create_connection(("127.0.0.1", 8000), timeout=1).close()
             return True
         except (socket.timeout, ConnectionRefusedError):
-            # Check if launcher webserving process has exited.
+            # Check if launcher webservice process has exited.
             # If so, a connection can never be made.
-            retcode = launcher.poll()
-            if retcode is not None:
-                raise RuntimeError(f"launcher exited unexpectedly with code {retcode}")
+            ret_code = launcher.poll()
+            if ret_code is not None:
+                raise RuntimeError(f"launcher exited unexpectedly with code {ret_code}")
             return False
 
     while not tabby_ready():
