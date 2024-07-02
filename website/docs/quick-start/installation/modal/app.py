@@ -11,10 +11,6 @@ GPU_CONFIG = gpu.L4()
 
 def download_model():
     import subprocess
-    import os
-
-    env = os.environ.copy()
-    env['RUST_LOG'] = 'debug'
 
     subprocess.run(
         [
@@ -22,8 +18,7 @@ def download_model():
             "download",
             "--model",
             MODEL_ID,
-        ],
-        env=env,
+        ]
     )
 
 
@@ -54,12 +49,8 @@ ee_dir = "/data/ee"
 def app_serve():
     import socket
     import subprocess
-    import os
     import time
     from asgi_proxy import asgi_proxy
-
-    env = os.environ.copy()
-    env['RUST_LOG'] = 'debug'
 
     launcher = subprocess.Popen(
         [
@@ -72,9 +63,8 @@ def app_serve():
             "--device",
             "cuda",
             "--parallelism",
-            "1",
-        ],
-        env=env,
+            "4",
+        ]
     )
 
     # Poll until webserver at 127.0.0.1:8000 accepts connections before running inputs.
