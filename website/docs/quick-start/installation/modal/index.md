@@ -7,6 +7,7 @@
 First we import the components we need from `modal`.
 
 ```python
+import os
 from modal import Image, App, asgi_app, gpu, Volume
 ```
 
@@ -15,7 +16,11 @@ Next, we set the base Docker image version and specify which model to serve, usi
 ```python
 IMAGE_NAME = "tabbyml/tabby"
 MODEL_ID = "TabbyML/StarCoder-1B"
+CHAT_MODEL_ID = "TabbyML/Qwen2-1.5B-Instruct"
 GPU_CONFIG = gpu.L4()
+
+TABBY_ENV = os.environ.copy()
+TABBY_ENV['TABBY_MODEL_CACHE_ROOT'] = '/models'
 ```
 
 Currently supported GPUs in Modal:
@@ -31,7 +36,9 @@ For detailed usage, please check official [Modal GPU reference](https://modal.co
 
 ## Define the container image
 
-We want to create a Modal image which has the Tabby model cache pre-populated. The benefit of this is that the container no longer has to re-download the model - instead, it will take advantage of Modal’s internal filesystem for faster cold starts.
+We want to create a Modal image which has the Tabby model cache pre-populated.
+The benefit of this is that the container no longer has to re-download the model—instead,
+it will take advantage of Modal’s internal filesystem for faster cold starts.
 
 ### Download the weights
 
@@ -45,8 +52,24 @@ def download_model():
             "download",
             "--model",
             MODEL_ID,
-        ]
+        ],
+        env=TABBY_ENV,
     )
+
+
+def download_chat_model():
+    import subprocess
+
+    subprocess.run(
+        [
+            "/opt/tabby/bin/tabby-cpu",
+            "download",
+            "--model",
+            CHAT_MODEL_ID,
+        ],
+        env=TABBY_ENV,
+    )
+
 ```
 
 ### Image definition
@@ -65,6 +88,7 @@ image = (
     )
     .dockerfile_commands("ENTRYPOINT []")
     .run_function(download_model)
+    .run_function(download_chat_model)
     .pip_install("asgi-proxy-lib")
 )
 ```
@@ -80,17 +104,17 @@ The endpoint function is represented with Modal's `@app.function`. Here, we:
 5. Use a Volume to efficiently manage the persistent storage of the "/data/ee" directory, crucial for housing Tabby's database.
 
 ```python
-app = App("tabby-server-" + MODEL_ID.split("/")[-1], image=image)
+app = App("tabby-server", image=image)
 
-ee_volume = Volume.from_name("tabby-ee-vol", create_if_missing=True)
-ee_dir = "/data/ee"
+data_volume = Volume.from_name("tabby-data-vol", create_if_missing=True)
+data_dir = "/data"
 
 @app.function(
     gpu=GPU_CONFIG,
     allow_concurrent_inputs=10,
     container_idle_timeout=120,
     timeout=360,
-    volumes={ee_dir: ee_volume},
+    volumes={data_dir: data_volume},
     _allow_background_volume_commits=True,
 )
 @asgi_app()
@@ -106,13 +130,16 @@ def app_serve():
             "serve",
             "--model",
             MODEL_ID,
+            "--chat-model",
+            CHAT_MODEL_ID,
             "--port",
             "8000",
             "--device",
             "cuda",
             "--parallelism",
             "4",
-        ]
+        ],
+        env=TABBY_ENV,
     )
 
     # Poll until webserver at 127.0.0.1:8000 accepts connections before running inputs.
@@ -121,7 +148,7 @@ def app_serve():
             socket.create_connection(("127.0.0.1", 8000), timeout=1).close()
             return True
         except (socket.timeout, ConnectionRefusedError):
-            # Check if launcher webservice process has exited.
+            # Check if a launcher webservice process has exited.
             # If so, a connection can never be made.
             ret_code = launcher.poll()
             if ret_code is not None:
@@ -141,5 +168,5 @@ Once we deploy this model with `modal serve app.py`, it will output the URL of t
 
 ![App Running](./app-running.png)
 
-Now it can be used as tabby server URL in Tabby editor extensions!
+Now it can be used as a tabby server URL in Tabby editor extensions!
 See [app.py](https://github.com/TabbyML/tabby/blob/main/website/docs/quick-start/installation/modal/app.py) for the full code used in this tutorial.

@@ -2,11 +2,16 @@
 modal serve app.py
 """
 
+import os
 from modal import Image, App, asgi_app, gpu, Volume
 
 IMAGE_NAME = "tabbyml/tabby"
 MODEL_ID = "TabbyML/StarCoder-1B"
+CHAT_MODEL_ID = "TabbyML/Qwen2-1.5B-Instruct"
 GPU_CONFIG = gpu.L4()
+
+TABBY_ENV = os.environ.copy()
+TABBY_ENV['TABBY_MODEL_CACHE_ROOT'] = '/models'
 
 
 def download_model():
@@ -18,7 +23,22 @@ def download_model():
             "download",
             "--model",
             MODEL_ID,
-        ]
+        ],
+        env=TABBY_ENV,
+    )
+
+
+def download_chat_model():
+    import subprocess
+
+    subprocess.run(
+        [
+            "/opt/tabby/bin/tabby-cpu",
+            "download",
+            "--model",
+            CHAT_MODEL_ID,
+        ],
+        env=TABBY_ENV,
     )
 
 
@@ -29,20 +49,21 @@ image = (
     )
     .dockerfile_commands("ENTRYPOINT []")
     .run_function(download_model)
+    .run_function(download_chat_model)
     .pip_install("asgi-proxy-lib")
 )
 
-app = App("tabby-server-" + MODEL_ID.split("/")[-1], image=image)
+app = App("tabby-server", image=image)
 
-ee_volume = Volume.from_name("tabby-ee-vol", create_if_missing=True)
-ee_dir = "/data/ee"
+data_volume = Volume.from_name("tabby-data-vol", create_if_missing=True)
+data_dir = "/data"
 
 @app.function(
     gpu=GPU_CONFIG,
     allow_concurrent_inputs=10,
     container_idle_timeout=120,
     timeout=360,
-    volumes={ee_dir: ee_volume},
+    volumes={data_dir: data_volume},
     _allow_background_volume_commits=True,
 )
 @asgi_app()
@@ -58,13 +79,16 @@ def app_serve():
             "serve",
             "--model",
             MODEL_ID,
+            "--chat-model",
+            CHAT_MODEL_ID,
             "--port",
             "8000",
             "--device",
             "cuda",
             "--parallelism",
             "4",
-        ]
+        ],
+        env=TABBY_ENV,
     )
 
     # Poll until webserver at 127.0.0.1:8000 accepts connections before running inputs.
@@ -73,7 +97,7 @@ def app_serve():
             socket.create_connection(("127.0.0.1", 8000), timeout=1).close()
             return True
         except (socket.timeout, ConnectionRefusedError):
-            # Check if launcher webservice process has exited.
+            # Check if a launcher webservice process has exited.
             # If so, a connection can never be made.
             ret_code = launcher.poll()
             if ret_code is not None:
