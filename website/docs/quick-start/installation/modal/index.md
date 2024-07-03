@@ -164,7 +164,7 @@ def app_serve():
 
 ### Serve the app
 
-Once we deploy this model with `modal serve app.py`, it will output the URL of the web endpoint, in a form of `https://<USERNAME>--tabby-server-starcoder-1b-app-serve-dev.modal.run`.
+Once we deploy this model with `modal serve app.py`, it will output the URL of the web endpoint, in a form of `https://<USERNAME>--tabby-server-app-serve-dev.modal.run`.
 
 ![App Running](./app-running.png)
 
