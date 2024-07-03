@@ -65,6 +65,7 @@ data_dir = "/data"
     timeout=360,
     volumes={data_dir: data_volume},
     _allow_background_volume_commits=True,
+    concurrency_limit=1,
 )
 @asgi_app()
 def app_serve():
