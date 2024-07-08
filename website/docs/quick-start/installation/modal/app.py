@@ -3,6 +3,7 @@ modal serve app.py
 """
 
 import os
+
 from modal import Image, App, asgi_app, gpu, Volume
 
 IMAGE_NAME = "tabbyml/tabby"
@@ -10,6 +11,7 @@ MODEL_ID = "TabbyML/StarCoder-1B"
 CHAT_MODEL_ID = "TabbyML/Qwen2-1.5B-Instruct"
 GPU_CONFIG = gpu.L4()
 
+TABBY_BIN = "/opt/tabby/bin/tabby"
 TABBY_ENV = os.environ.copy()
 TABBY_ENV['TABBY_MODEL_CACHE_ROOT'] = '/models'
 
@@ -19,7 +21,7 @@ def download_model():
 
     subprocess.run(
         [
-            "/opt/tabby/bin/tabby-cpu",
+            TABBY_BIN,
             "download",
             "--model",
             MODEL_ID,
@@ -33,7 +35,7 @@ def download_chat_model():
 
     subprocess.run(
         [
-            "/opt/tabby/bin/tabby-cpu",
+            TABBY_BIN,
             "download",
             "--model",
             CHAT_MODEL_ID,
@@ -76,7 +78,7 @@ def app_serve():
 
     launcher = subprocess.Popen(
         [
-            "/opt/tabby/bin/tabby",
+            TABBY_BIN,
             "serve",
             "--model",
             MODEL_ID,
