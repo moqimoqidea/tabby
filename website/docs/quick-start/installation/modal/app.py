@@ -1,5 +1,8 @@
 """Usage:
 modal serve app.py
+
+To force a rebuild by pulling the latest image tag, use:
+MODAL_FORCE_BUILD=1 modal serve app.py
 """
 
 import os

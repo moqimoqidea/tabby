@@ -166,7 +166,9 @@ def app_serve():
 
 ### Serve the app
 
-Once we deploy this model with `modal serve app.py`, it will output the URL of the web endpoint, in a form of `https://<USERNAME>--tabby-server-app-serve-dev.modal.run`.
+Once we deploy this model with `modal serve app.py`, it will output the URL of the web endpoint, in the form of `https://<USERNAME>--tabby-server-app-serve-dev.modal.run`.
+
+If you encounter any issues, particularly related to caching, you can force a rebuild by running `MODAL_FORCE_BUILD=1 modal serve app.py`. This ensures that the latest image tag is used by ignoring cached layers.
 
 ![App Running](./app-running.png)
 
