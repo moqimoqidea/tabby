@@ -1,4 +1,5 @@
 import argparse
+import json
 import logging
 import os
 import signal
@@ -7,11 +8,11 @@ import threading
 import time
 
 import httpx
+import pandas as pd
+from pandas import json_normalize
 
-# Define the embedding model id
 EMBEDDING_MODEL_ID = "TabbyML/Nomic-Embed-Text"
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(message)s',
@@ -25,7 +26,7 @@ def check_service_health(endpoint, token):
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json",
-            "Authorization": "Bearer {}".format(token)
+            "Authorization": f'Bearer {token}'
         }
 
         try:
@@ -36,7 +37,7 @@ def check_service_health(endpoint, token):
             else:
                 return False
         except Exception as e:
-            logging.error(f"Error making request: {e}")
+            logging.error(f"Failed to check service health: {e}")
             return False
 
     while not modal_tabby_ready():
@@ -66,7 +67,6 @@ def start_tabby_server(model):
                                text=True,
                                env=modal_env)
 
-    # Start a thread to monitor the output
     threading.Thread(target=monitor_serve_output, args=(process,)).start()
 
     return process
@@ -78,6 +78,47 @@ def send_sigint_to_process(process):
         logging.info("SIGINT signal sent successfully.")
     except Exception as e:
         logging.error(f"Failed to send SIGINT signal: {e}")
+
+
+def generate_predictions(endpoint, token, model, jsonl_file):
+    df = pd.read_json(jsonl_file, lines=True)
+    df_flat = json_normalize(df.to_dict(orient="records"))
+
+    headers = {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+        'Authorization': f'Bearer {token}'
+    }
+
+    predictions = []
+    for index, row in df_flat.iterrows():
+        payload = {
+            "language": row['language'],
+            "segments": {
+                "prefix": row['segments.prefix'],
+                "suffix": row['segments.suffix']
+            }
+        }
+
+        # TODO: Add retry logic, parallelism.
+        url = f"{endpoint}/v1/completions"
+        response = httpx.post(url=url, headers=headers, content=json.dumps(payload), timeout=10)
+
+        if response.status_code == 200:
+            predictions.append(response.json()['choices'][0]['text'])
+        else:
+            predictions.append("Request failed after retry.")
+
+    df_flat['prediction'] = predictions
+    formatted_timestamp = time.strftime("%Y%m%d%H%M%S")
+    prediction_jsonl_file = f"{formatted_timestamp}-{model.replace('/', '-')}.jsonl"
+    df_flat.to_json(prediction_jsonl_file, orient='records', lines=True)
+
+    return prediction_jsonl_file
+
+
+def evaluation(prediction_jsonl_file):
+    pass
 
 
 def eval_code_completion(endpoint: str,
@@ -94,9 +135,14 @@ def eval_code_completion(endpoint: str,
     logging.info("Checking service health...")
     check_service_health(endpoint, token)
 
+    # Generate predictions
+    logging.info("Generating predictions...")
+    prediction_jsonl_file = generate_predictions(endpoint, token, model, jsonl_file)
+    logging.info("Predictions generated!")
+
     # Run the evaluation
     logging.info("Running evaluation...")
-    time.sleep(10)
+    evaluation(prediction_jsonl_file)
     logging.info("Evaluation completed")
 
     # Stop the server
