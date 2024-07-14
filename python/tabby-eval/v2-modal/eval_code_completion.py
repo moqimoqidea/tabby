@@ -53,7 +53,7 @@ def monitor_serve_output(process):
         logging.info(line.strip())
 
 
-def start_tabby_server(endpoint, token, model):
+def start_tabby_server(model):
     logging.info("Starting tabby server for model {model}".format(model=model))
 
     modal_env = os.environ.copy()
@@ -88,7 +88,7 @@ def eval_code_completion(endpoint: str,
     # Start modal tabby server
     process = None
     if need_manager_modal:
-        process = start_tabby_server(endpoint, token, model)
+        process = start_tabby_server(model)
 
     # Check the service health
     logging.info("Checking service health...")
