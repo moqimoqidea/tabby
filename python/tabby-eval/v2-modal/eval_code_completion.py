@@ -1,6 +1,7 @@
 import argparse
 import logging
 import os
+import signal
 import subprocess
 import threading
 import time
@@ -78,6 +79,14 @@ def start_tabby_server(endpoint, token, model):
     return process
 
 
+def send_sigint_to_process(process):
+    try:
+        os.kill(process.pid, signal.SIGINT)
+        logging.info("SIGINT signal sent successfully.")
+    except Exception as e:
+        logging.error(f"Failed to send SIGINT signal: {e}")
+
+
 def eval_code_completion(endpoint, token, model, data):
     # Start modal tabby server
     process = start_tabby_server(endpoint, token, model)
@@ -88,7 +97,7 @@ def eval_code_completion(endpoint, token, model, data):
 
     # Stop the server
     logging.info("Stopping server...")
-    process.terminate()
+    send_sigint_to_process(process)
     time.sleep(10)
     logging.info("Server stopped!")
 
