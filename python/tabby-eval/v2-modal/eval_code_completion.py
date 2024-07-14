@@ -19,7 +19,7 @@ logging.basicConfig(
 )
 
 
-def check_service_health(endpoint, token, model):
+def check_service_health(endpoint, token):
     def modal_tabby_ready():
         url = "{}/v1/health".format(endpoint)
         headers = {
@@ -31,12 +31,8 @@ def check_service_health(endpoint, token, model):
         try:
             response = httpx.get(url=url, headers=headers, timeout=5)
             if response.status_code == 200:
-                response_data = response.json()
-                if response_data.get("model") == model:
-                    logging.info("Server details: {}".format(response_data))
-                    return True
-                else:
-                    return False
+                logging.info("Server details: {}".format(response.json()))
+                return True
             else:
                 return False
         except Exception as e:
@@ -74,7 +70,7 @@ def start_tabby_server(endpoint, token, model):
 
     # Check the service health
     logging.info("Checking service health...")
-    check_service_health(endpoint, token, model)
+    check_service_health(endpoint, token)
 
     return process
 
