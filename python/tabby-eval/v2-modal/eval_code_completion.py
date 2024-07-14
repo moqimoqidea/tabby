@@ -1,15 +1,24 @@
 import argparse
+import logging
 import os
 import subprocess
+import threading
 import time
-from datetime import datetime
 
 import httpx
 
+# Define the embedding model id
 EMBEDDING_MODEL_ID = "TabbyML/Nomic-Embed-Text"
 
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
 
-def check_service_health(endpoint, token):
+
+def check_service_health(endpoint, token, model):
     def modal_tabby_ready():
         url = "{}/v1/health".format(endpoint)
         headers = {
@@ -19,39 +28,52 @@ def check_service_health(endpoint, token):
         }
 
         try:
-            response = httpx.get(url=url, headers=headers, timeout=2)
+            response = httpx.get(url=url, headers=headers, timeout=5)
             if response.status_code == 200:
-                print("Server details: ", response.json())
-                return True
+                response_data = response.json()
+                if response_data.get("model") == model:
+                    logging.info("Server details: {}".format(response_data))
+                    return True
+                else:
+                    return False
             else:
                 return False
         except Exception as e:
-            print(f"Error making request: {e}")
+            logging.error(f"Error making request: {e}")
             return False
 
     while not modal_tabby_ready():
-        time.sleep(1)
+        time.sleep(5)
 
-    print("Modal tabby server ready!")
+    logging.info("Modal tabby server ready!")
+
+
+def monitor_serve_output(process):
+    while True:
+        line = process.stdout.readline()
+        if not line:
+            break
+        logging.info(line.strip())
 
 
 def start_tabby_server(endpoint, token, model):
-    start_time = datetime.now()
-    print(f"{start_time}: Starting tabby server for model {model}")
+    logging.info("Starting tabby server for model {model}".format(model=model))
 
     modal_env = os.environ.copy()
     modal_env["MODEL_ID"] = model
     modal_env["EMBEDDING_MODEL_ID"] = EMBEDDING_MODEL_ID
 
-    # Set environment variables and start the service
-    process = subprocess.Popen([
-        "modal",
-        "serve",
-        "app.py"
-    ], env=modal_env)
+    process = subprocess.Popen(args=["modal", "serve", "app.py"],
+                               stdout=subprocess.PIPE,
+                               stderr=subprocess.STDOUT,
+                               text=True,
+                               env=modal_env)
+    # Start a thread to monitor the output
+    threading.Thread(target=monitor_serve_output, args=(process,)).start()
 
     # Check the service health
-    check_service_health(endpoint, token)
+    logging.info("Checking service health...")
+    check_service_health(endpoint, token, model)
 
     return process
 
@@ -59,15 +81,16 @@ def start_tabby_server(endpoint, token, model):
 def eval_code_completion(endpoint, token, model, data):
     # Start modal tabby server
     process = start_tabby_server(endpoint, token, model)
-    print("{}: Tabby server started", datetime.now())
 
     # Run the evaluation
-    print("Running evaluation...")
+    logging.info("Running evaluation...")
+    time.sleep(10)
 
     # Stop the server
-    print("Stopping server...")
+    logging.info("Stopping server...")
     process.terminate()
-    print("Server stopped!")
+    time.sleep(10)
+    logging.info("Server stopped!")
 
 
 if __name__ == "__main__":
@@ -78,5 +101,4 @@ if __name__ == "__main__":
     parser.add_argument("--data", type=str, default="data.jsonl", help="The jsonl file to use.")
 
     args = parser.parse_args()
-
     eval_code_completion(args.endpoint, args.token, args.model, args.data)
