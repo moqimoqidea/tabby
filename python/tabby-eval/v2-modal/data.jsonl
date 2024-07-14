@@ -1,0 +1,1 @@
+{"language": "python", "segments": {"prefix": "def fib(n):\n    ", "suffix": "\n        return fib(n - 1) + fib(n - 2)"}}
