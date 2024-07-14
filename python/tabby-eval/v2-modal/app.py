@@ -12,6 +12,8 @@ from modal import Image, App, asgi_app, gpu, Volume
 IMAGE_NAME = "tabbyml/tabby"
 EMBEDDING_MODEL_ID = os.getenv("EMBEDDING_MODEL_ID")
 MODEL_ID = os.getenv("MODEL_ID")
+
+# TODO: If you're testing large datasets, consider using a better GPU and higher parallelism
 GPU_CONFIG = gpu.T4()
 
 TABBY_BIN = "/opt/tabby/bin/tabby"

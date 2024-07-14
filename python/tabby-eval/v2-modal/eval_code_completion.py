@@ -11,6 +11,8 @@ import httpx
 import pandas as pd
 from pandas import json_normalize
 
+from eval_code_completion_jsonl import evaluation
+
 EMBEDDING_MODEL_ID = "TabbyML/Nomic-Embed-Text"
 
 logging.basicConfig(
@@ -117,10 +119,6 @@ def generate_predictions(endpoint, token, model, jsonl_file):
     return prediction_jsonl_file
 
 
-def evaluation(prediction_jsonl_file):
-    pass
-
-
 def eval_code_completion(endpoint: str,
                          token: str,
                          model: str,
@@ -153,11 +151,11 @@ def eval_code_completion(endpoint: str,
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Process some integers.")
-    parser.add_argument("--endpoint", type=str, required=True, help="The ip to use.")
-    parser.add_argument("--token", type=str, required=True, default="", help="The ip to use.")
-    parser.add_argument("--model", type=str, required=True, help="The model to use.")
-    parser.add_argument("--jsonl_file", type=str, default="data.jsonl", help="The jsonl file to use.")
+    parser = argparse.ArgumentParser(description="eval tabby code completion.")
+    parser.add_argument("--endpoint", type=str, required=True, help="tabby server endpoint.")
+    parser.add_argument("--token", type=str, required=True, default="", help="tabby server token.")
+    parser.add_argument("--model", type=str, required=True, help="evaluation model.")
+    parser.add_argument("--jsonl_file", type=str, default="data.jsonl", help="evaluation jsonl file.")
     parser.add_argument("--need_manager_modal", type=str, default="1",
                         help="Whether a manager modal is needed. Accepts 1 or another.")
 
