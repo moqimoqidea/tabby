@@ -65,12 +65,9 @@ def start_tabby_server(endpoint, token, model):
                                stderr=subprocess.STDOUT,
                                text=True,
                                env=modal_env)
+
     # Start a thread to monitor the output
     threading.Thread(target=monitor_serve_output, args=(process,)).start()
-
-    # Check the service health
-    logging.info("Checking service health...")
-    check_service_health(endpoint, token)
 
     return process
 
@@ -83,27 +80,41 @@ def send_sigint_to_process(process):
         logging.error(f"Failed to send SIGINT signal: {e}")
 
 
-def eval_code_completion(endpoint, token, model, data):
+def eval_code_completion(endpoint: str,
+                         token: str,
+                         model: str,
+                         jsonl_file: str,
+                         need_manager_modal: bool):
     # Start modal tabby server
-    process = start_tabby_server(endpoint, token, model)
+    process = None
+    if need_manager_modal:
+        process = start_tabby_server(endpoint, token, model)
+
+    # Check the service health
+    logging.info("Checking service health...")
+    check_service_health(endpoint, token)
 
     # Run the evaluation
     logging.info("Running evaluation...")
     time.sleep(10)
+    logging.info("Evaluation completed")
 
     # Stop the server
-    logging.info("Stopping server...")
-    send_sigint_to_process(process)
-    time.sleep(10)
-    logging.info("Server stopped!")
+    if need_manager_modal and process:
+        logging.info("Stopping server...")
+        send_sigint_to_process(process)
+        logging.info("Server stopped!")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Process some integers.")
     parser.add_argument("--endpoint", type=str, required=True, help="The ip to use.")
-    parser.add_argument("--token", type=str, required=True, help="The ip to use.")
+    parser.add_argument("--token", type=str, required=True, default="", help="The ip to use.")
     parser.add_argument("--model", type=str, required=True, help="The model to use.")
-    parser.add_argument("--data", type=str, default="data.jsonl", help="The jsonl file to use.")
+    parser.add_argument("--jsonl_file", type=str, default="data.jsonl", help="The jsonl file to use.")
+    parser.add_argument("--need_manager_modal", type=str, default="1",
+                        help="Whether a manager modal is needed. Accepts 1 or another.")
 
     args = parser.parse_args()
-    eval_code_completion(args.endpoint, args.token, args.model, args.data)
+    bool_need_manager_modal = True if args.need_manager_modal == "1" else False
+    eval_code_completion(args.endpoint, args.token, args.model, args.jsonl_file, bool_need_manager_modal)
