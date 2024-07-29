@@ -13,6 +13,7 @@ use tabby_common::{
     registry::{parse_model_id, ModelRegistry, GGML_MODEL_RELATIVE_PATH},
 };
 use tabby_inference::{ChatCompletionStream, CompletionOptions, CompletionStream, Embedding};
+use tracing::{instrument, warn, error, debug};
 
 fn api_endpoint(port: u16) -> String {
     format!("http://127.0.0.1:{port}")
@@ -148,6 +149,7 @@ impl ChatCompletionServer {
 
 #[async_trait]
 impl ChatCompletionStream for ChatCompletionServer {
+    #[instrument(skip(self, request))]
     async fn chat(
         &self,
         request: async_openai::types::CreateChatCompletionRequest,
@@ -155,11 +157,22 @@ impl ChatCompletionStream for ChatCompletionServer {
         self.chat_completion.chat(request).await
     }
 
+    #[instrument(skip(self, request))]
     async fn chat_stream(
         &self,
         request: async_openai::types::CreateChatCompletionRequest,
     ) -> Result<async_openai::types::ChatCompletionResponseStream, OpenAIError> {
-        self.chat_completion.chat_stream(request).await
+        debug!("Starting chat stream with request: {:?}", request);
+        match self.chat_completion.chat_stream(request).await {
+            Ok(stream) => {
+                debug!("Chat stream started successfully");
+                Ok(stream)
+            }
+            Err(err) => {
+                error!("Failed to start chat stream: {:?}", err);
+                Err(err)
+            }
+        }
     }
 }
 

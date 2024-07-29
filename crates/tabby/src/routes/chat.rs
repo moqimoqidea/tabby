@@ -1,5 +1,5 @@
 use std::sync::Arc;
-
+use std::time::Duration;
 use axum::{
     extract::State,
     response::sse::{Event, KeepAlive, Sse},
@@ -10,7 +10,7 @@ use futures::{Stream, StreamExt};
 use hyper::StatusCode;
 use tabby_common::axum::MaybeUser;
 use tabby_inference::ChatCompletionStream;
-use tracing::{instrument, warn};
+use tracing::{instrument, warn, error, debug};
 
 #[utoipa::path(
     post,
@@ -49,10 +49,35 @@ pub async fn chat_completions(
     };
 
     let s = s.map(|chunk| {
-        let chunk = chunk?;
-        let json = serde_json::to_string(&chunk)?;
-        Ok(Event::default().data(json))
+        match chunk {
+            Ok(chunk) => {
+                match serde_json::to_string(&chunk) {
+                    Ok(json) => {
+                        debug!("Sending chunk: {}", json);
+                        Ok(Event::default().data(json))
+                    }
+                    Err(e) => {
+                        error!("Serialization error: {}", e);
+                        Err(anyhow::Error::msg(e.to_string()))
+                    }
+                }
+            }
+            Err(e) => {
+                error!("Chunk error: {}", e);
+                // Err(anyhow::Error::msg(e.to_string()))
+                // Send empty JSON chunk to ensure proper stream ending
+                Ok(Event::default().data("{}"))
+            }
+        }
+    }).chain(futures::stream::once(async {
+        // Send final empty JSON chunk to ensure proper stream ending
+        let final_event = Event::default().data("{}");
+        Ok(final_event)
+    })).inspect(|result| {
+        if let Err(ref e) = result {
+            error!("Stream item error: {:?}", e);
+        }
     });
 
-    Ok(Sse::new(s).keep_alive(KeepAlive::default()))
+    Ok(Sse::new(s).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)).text("keep-alive")))
 }
