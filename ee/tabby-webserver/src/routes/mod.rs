@@ -66,12 +66,7 @@ pub fn create(
             "/repositories",
             repositories::routes(ctx.repository(), ctx.auth()),
         )
-        .route(
-            "/avatar/:id",
-            routing::get(avatar)
-                .with_state(ctx.auth())
-                .layer(from_fn_with_state(ctx.auth(), require_login_middleware)),
-        )
+        .route("/avatar/:id", routing::get(avatar).with_state(ctx.auth()))
         .nest("/oauth", oauth::routes(ctx.auth()));
 
     let ui = ui.route("/graphiql", routing::get(graphiql("/graphql", None)));
@@ -84,7 +79,7 @@ pub fn create(
 pub(crate) async fn require_login_middleware(
     State(auth): State<Arc<dyn AuthenticationService>>,
     AuthBearer(token): AuthBearer,
-    request: Request<Body>,
+    mut request: Request<Body>,
     next: Next,
 ) -> axum::response::Response {
     let unauthorized = axum::response::Response::builder()
@@ -97,9 +92,15 @@ pub(crate) async fn require_login_middleware(
         return unauthorized;
     };
 
-    let Ok(_) = auth.verify_access_token(&token).await else {
+    let Ok(jwt) = auth.verify_access_token(&token).await else {
         return unauthorized;
     };
+
+    let Ok(user) = auth.get_user(&jwt.sub).await else {
+        return unauthorized;
+    };
+
+    request.extensions_mut().insert(user.policy);
 
     next.run(request).await
 }

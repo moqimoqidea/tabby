@@ -3,6 +3,7 @@ use std::sync::Arc;
 use strfmt::strfmt;
 use tabby_common::{
     api::code::{CodeSearch, CodeSearchError, CodeSearchParams, CodeSearchQuery},
+    axum::AllowedCodeRepository,
     languages::get_language,
 };
 use tracing::warn;
@@ -36,7 +37,12 @@ impl PromptBuilder {
         strfmt!(prompt_template, prefix => prefix, suffix => suffix).unwrap()
     }
 
-    pub async fn collect(&self, language: &str, segments: &Segments) -> Vec<Snippet> {
+    pub async fn collect(
+        &self,
+        language: &str,
+        segments: &Segments,
+        allowed_code_repository: &AllowedCodeRepository,
+    ) -> Vec<Snippet> {
         let quota_threshold_for_snippets_from_code_search = 256;
         let mut max_snippets_chars_in_prompt = 768;
         let mut snippets: Vec<Snippet> = vec![];
@@ -60,11 +66,15 @@ impl PromptBuilder {
             return snippets;
         };
 
+        let Some(source_id) = allowed_code_repository.closest_match(git_url) else {
+            return snippets;
+        };
+
         let snippets_from_code_search = collect_snippets(
             &self.code_search_params,
             max_snippets_chars_in_prompt,
             code.as_ref(),
-            git_url,
+            source_id,
             segments.filepath.as_deref(),
             language,
             &segments.prefix,
@@ -145,7 +155,6 @@ fn extract_snippets_from_segments(
             if count_characters + declaration.body.len() > max_snippets_chars {
                 break;
             }
-
             count_characters += declaration.body.len();
             ret.push(Snippet {
                 filepath: declaration.filepath.clone(),
@@ -171,6 +180,22 @@ fn extract_snippets_from_segments(
         }
     }
 
+    // then comes to the snippets from recently opened files.
+    if let Some(relevant_snippets) = &segments.relevant_snippets_from_recently_opened_files {
+        for snippet in relevant_snippets {
+            if count_characters + snippet.body.len() > max_snippets_chars {
+                break;
+            }
+
+            count_characters += snippet.body.len();
+            ret.push(Snippet {
+                filepath: snippet.filepath.clone(),
+                body: snippet.body.clone(),
+                score: 1.0,
+            });
+        }
+    }
+
     if ret.is_empty() {
         None
     } else {
@@ -182,16 +207,16 @@ async fn collect_snippets(
     code_search_params: &CodeSearchParams,
     max_snippets_chars: usize,
     code: &dyn CodeSearch,
-    git_url: &str,
+    source_id: &str,
     filepath: Option<&str>,
     language: &str,
     content: &str,
 ) -> Vec<Snippet> {
     let query = CodeSearchQuery::new(
-        git_url.to_owned(),
         filepath.map(|x| x.to_owned()),
         Some(language.to_owned()),
         content.to_owned(),
+        source_id.to_owned(),
     );
 
     let mut ret = Vec::new();
@@ -266,6 +291,7 @@ mod tests {
             git_url: None,
             declarations: None,
             relevant_snippets_from_changed_files: None,
+            relevant_snippets_from_recently_opened_files: None,
             clipboard: None,
         }
     }
@@ -486,6 +512,7 @@ def this_is_prefix():\n";
             git_url: None,
             declarations: None,
             relevant_snippets_from_changed_files: None,
+            relevant_snippets_from_recently_opened_files: None,
             clipboard: None,
         };
 
@@ -507,12 +534,17 @@ def this_is_prefix():\n";
                 body: "res_1 = invoke_function_1(n)".to_owned(),
                 score: 1.0,
             }]),
+            relevant_snippets_from_recently_opened_files: Some(vec![Snippet {
+                filepath: "b1.py".to_owned(),
+                body: "res_1 = invoke_function_1(n)".to_owned(),
+                score: 1.0,
+            }]),
             clipboard: None,
         };
 
         assert!(
             extract_snippets_from_segments(max_snippets_chars, &segments)
-                .is_some_and(|x| x.1.len() == 2)
+                .is_some_and(|x| x.1.len() == 3)
         );
     }
 }

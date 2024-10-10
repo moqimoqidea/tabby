@@ -1,7 +1,8 @@
-import React from 'react'
-import { compact, findIndex } from 'lodash-es'
-import type { Context, NavigateOpts } from 'tabby-chat-panel'
+import React, { RefObject } from 'react'
+import { compact, findIndex, isEqual, some, uniqWith } from 'lodash-es'
+import type { Context, FileContext, NavigateOpts } from 'tabby-chat-panel'
 
+import { ERROR_CODE_NOT_FOUND } from '@/lib/constants'
 import {
   CodeQueryInput,
   CreateMessageInput,
@@ -11,7 +12,7 @@ import {
 } from '@/lib/gql/generates/graphql'
 import { useDebounceCallback } from '@/lib/hooks/use-debounce'
 import { useLatest } from '@/lib/hooks/use-latest'
-import { useThreadRun } from '@/lib/hooks/use-thread-run'
+import { ExtendedCombinedError, useThreadRun } from '@/lib/hooks/use-thread-run'
 import { filename2prism } from '@/lib/language-utils'
 import {
   AssistantMessage,
@@ -39,25 +40,15 @@ type ChatContextValue = {
   onClearMessages: () => void
   container?: HTMLDivElement
   onCopyContent?: (value: string) => void
-  client?: string
   onApplyInEditor?: (value: string) => void
   relevantContext: Context[]
   removeRelevantContext: (index: number) => void
+  chatInputRef: RefObject<HTMLTextAreaElement>
 }
 
 export const ChatContext = React.createContext<ChatContextValue>(
   {} as ChatContextValue
 )
-
-// FIXME remove
-function selectContextToMessageContent(
-  context: UserMessage['selectContext']
-): string {
-  if (!context || !context.content) return ''
-  const { content, filepath } = context
-  const language = filename2prism(filepath)?.[0]
-  return `\n${'```'}${language ?? ''}\n${content ?? ''}\n${'```'}\n`
-}
 
 export interface ChatRef {
   sendUserChat: (message: UserMessageWithOptionalId) => void
@@ -70,7 +61,6 @@ export interface ChatRef {
 interface ChatProps extends React.ComponentProps<'div'> {
   chatId: string
   api?: string
-  headers?: Record<string, string> | Headers
   initialMessages?: QuestionAnswerPair[]
   onLoaded?: () => void
   onThreadUpdates?: (messages: QuestionAnswerPair[]) => void
@@ -82,9 +72,9 @@ interface ChatProps extends React.ComponentProps<'div'> {
   welcomeMessage?: string
   promptFormClassname?: string
   onCopyContent?: (value: string) => void
-  client?: string
   onSubmitMessage?: (msg: string, relevantContext?: Context[]) => Promise<void>
   onApplyInEditor?: (value: string) => void
+  chatInputRef: RefObject<HTMLTextAreaElement>
 }
 
 function ChatRenderer(
@@ -92,7 +82,6 @@ function ChatRenderer(
     className,
     chatId,
     initialMessages,
-    headers,
     onLoaded,
     onThreadUpdates,
     onNavigateToContext,
@@ -103,9 +92,9 @@ function ChatRenderer(
     welcomeMessage,
     promptFormClassname,
     onCopyContent,
-    client,
     onSubmitMessage,
-    onApplyInEditor
+    onApplyInEditor,
+    chatInputRef
   }: ChatProps,
   ref: React.ForwardedRef<ChatRef>
 ) {
@@ -126,8 +115,7 @@ function ChatRenderer(
     regenerate,
     deleteThreadMessagePair
   } = useThreadRun({
-    threadId,
-    headers
+    threadId
   })
 
   const onDeleteMessage = async (userMessageId: string) => {
@@ -222,22 +210,18 @@ function ChatRenderer(
     const lastQaPairs = qaPairs[qaPairs.length - 1]
 
     // update threadId
-    if (answer?.threadCreated && !threadId) {
-      setThreadId(answer.threadCreated)
+    if (answer.threadId && !threadId) {
+      setThreadId(answer.threadId)
     }
 
     setQaPairs(prev => {
       const assisatntMessage = prev[prev.length - 1].assistant
       const nextAssistantMessage: AssistantMessage = {
         ...assisatntMessage,
-        id:
-          answer?.threadAssistantMessageCreated ||
-          assisatntMessage?.id ||
-          nanoid(),
-        message: answer.threadAssistantMessageContentDelta ?? '',
+        id: answer.assistantMessageId || assisatntMessage?.id || nanoid(),
+        message: answer.content,
         error: undefined,
-        relevant_code:
-          answer?.threadAssistantMessageAttachmentsCode?.map(o => o.code) ?? []
+        relevant_code: answer.attachmentsCode?.map(o => o.code) ?? []
       }
       // merge assistantMessage
       return [
@@ -245,7 +229,7 @@ function ChatRenderer(
         {
           user: {
             ...lastQaPairs.user,
-            id: answer?.threadUserMessageCreated || lastQaPairs.user.id
+            id: answer?.userMessageId || lastQaPairs.user.id
           },
           assistant: nextAssistantMessage
         }
@@ -286,11 +270,15 @@ function ChatRenderer(
               ...lastQaPairs.assistant,
               id: lastQaPairs.assistant?.id || nanoid(),
               message: lastQaPairs.assistant?.message ?? '',
-              error: error?.message === '401' ? 'Unauthorized' : 'Fail to fetch'
+              error: formatThreadRunErrorMessage(error)
             }
           }
         ]
       })
+    }
+
+    if (error?.message === 'Thread not found' && !qaPairs?.length) {
+      onClearMessages()
     }
   }, [error])
 
@@ -311,22 +299,19 @@ function ChatRenderer(
         }
       : null
 
-    const attachmentCode: MessageAttachmentCodeInput[] = compact([
-      // activeCode in IDE
-      userMessage?.activeContext
-        ? {
-            content: userMessage?.activeContext.content,
-            filepath: userMessage?.activeContext.filepath,
-            startLine: userMessage.activeContext.range.start
-          }
-        : undefined,
-      // relevantCode
-      ...(userMessage?.relevantContext?.map(o => ({
-        filepath: o.filepath,
-        content: o.content,
-        startLine: o.range.start
-      })) ?? [])
-    ])
+    const fileContext: FileContext[] = uniqWith(
+      compact([
+        userMessage?.activeContext,
+        ...(userMessage?.relevantContext || [])
+      ]),
+      isEqual
+    )
+
+    const attachmentCode: MessageAttachmentCodeInput[] = fileContext.map(o => ({
+      content: o.content,
+      filepath: o.filepath,
+      startLine: o.range.start
+    }))
 
     const content = userMessage.message
 
@@ -338,7 +323,7 @@ function ChatRenderer(
         }
       },
       {
-        docQuery: docQuery ? { content } : null,
+        docQuery: docQuery ? { content, searchPublic: false } : null,
         generateRelevantQuestions: !!generateRelevantQuestions,
         codeQuery
       }
@@ -460,14 +445,16 @@ function ChatRenderer(
         onClearMessages,
         container,
         onCopyContent,
-        client,
         onApplyInEditor,
         relevantContext,
-        removeRelevantContext
+        removeRelevantContext,
+        chatInputRef
       }}
     >
       <div className="flex justify-center overflow-x-hidden">
-        <div className={`w-full px-4 ${chatMaxWidthClass}`}>
+        <div
+          className={`w-full px-4 md:pl-10 md:pr-[3.75rem] ${chatMaxWidthClass}`}
+        >
           {/* FIXME: pb-[200px] might not enough when adding a large number of relevantContext */}
           <div className={cn('pb-[200px] pt-4 md:pt-10', className)}>
             {qaPairs?.length ? (
@@ -494,6 +481,7 @@ function ChatRenderer(
             setInput={setInput}
             chatMaxWidthClass={chatMaxWidthClass}
             ref={chatPanelRef}
+            chatInputRef={chatInputRef}
           />
         </div>
       </div>
@@ -505,21 +493,26 @@ function appendContextAndDedupe(
   ctxList: Context[],
   newCtx: Context
 ): Context[] {
-  if (!ctxList.some(ctx => isContextEqual(ctx, newCtx))) {
+  if (!ctxList.some(ctx => isEqual(ctx, newCtx))) {
     return ctxList.concat([newCtx])
   }
   return ctxList
 }
 
-function isContextEqual(lhs: Context, rhs: Context): boolean {
-  return (
-    lhs.kind === rhs.kind &&
-    lhs.range.start === rhs.range.start &&
-    lhs.range.end === rhs.range.end &&
-    lhs.filepath === rhs.filepath &&
-    lhs.content === rhs.content &&
-    lhs.git_url === rhs.git_url
-  )
-}
-
 export const Chat = React.forwardRef<ChatRef, ChatProps>(ChatRenderer)
+
+function formatThreadRunErrorMessage(error: ExtendedCombinedError | undefined) {
+  if (!error) return 'Failed to fetch'
+
+  if (error.message === '401') {
+    return 'Unauthorized'
+  }
+
+  if (
+    some(error.graphQLErrors, o => o.extensions?.code === ERROR_CODE_NOT_FOUND)
+  ) {
+    return `The thread has expired, please click ${"'"}Clear${"'"} and try again.`
+  }
+
+  return error.message || 'Failed to fetch'
+}

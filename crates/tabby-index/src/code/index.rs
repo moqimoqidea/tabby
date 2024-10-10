@@ -46,12 +46,7 @@ pub async fn index_repository(embedding: Arc<dyn Embedding>, repository: &CodeRe
     while let Some(files) = file_stream.next().await {
         count_files += files.len();
         count_chunks += add_changed_documents(repository, embedding.clone(), files).await;
-        logkit::info!(
-            "{}/{} files has been processed, {} has been indexed",
-            count_files,
-            total_files,
-            count_chunks
-        );
+        logkit::info!("Processed {count_files}/{total_files} files, updated {count_chunks} chunks",);
     }
 }
 
@@ -155,7 +150,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_code_splitter() {
-        // First file, chat/openai_chat.rs
+        // First file, tabby-inference/src/decoding.rs
         let file_contents = include_str!("../../../tabby-inference/src/decoding.rs");
 
         let rust_chunks = CodeIntelligence::chunks(file_contents, "rust")

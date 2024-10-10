@@ -9,6 +9,7 @@ use tabby_common::{
         code::CodeSearch,
         event::{Event, EventLogger},
     },
+    axum::AllowedCodeRepository,
     config::{CompletionConfig, ModelConfig},
     languages::get_language,
 };
@@ -135,6 +136,16 @@ pub struct Segments {
     /// Sorted in descending order of [Snippet::score].
     relevant_snippets_from_changed_files: Option<Vec<Snippet>>,
 
+    /// The relevant code snippets extracted from recently opened files.
+    /// These snippets are selected from candidates found within code chunks
+    /// based on the last visited location.
+    ///
+    /// Current Active file is excluded from the search candidates.
+    /// When provided with [Segments::relevant_snippets_from_changed_files], the snippets have
+    /// already been deduplicated to ensure no duplication with entries
+    /// in [Segments::relevant_snippets_from_changed_files].
+    relevant_snippets_from_recently_opened_files: Option<Vec<Snippet>>,
+
     /// Clipboard content when requesting code completion.
     clipboard: Option<String>,
 }
@@ -259,13 +270,16 @@ impl CompletionService {
         &self,
         language: &str,
         segments: &Segments,
+        allowed_code_repository: &AllowedCodeRepository,
         disable_retrieval_augmented_code_completion: bool,
     ) -> Vec<Snippet> {
         if disable_retrieval_augmented_code_completion {
             return vec![];
         }
 
-        self.prompt_builder.collect(language, segments).await
+        self.prompt_builder
+            .collect(language, segments, allowed_code_repository)
+            .await
     }
 
     fn text_generation_options(
@@ -294,7 +308,8 @@ impl CompletionService {
     pub async fn generate(
         &self,
         request: &CompletionRequest,
-        user_agent: &str,
+        allowed_code_repository: &AllowedCodeRepository,
+        user_agent: Option<&str>,
     ) -> Result<CompletionResponse, CompletionError> {
         let completion_id = format!("cmpl-{}", uuid::Uuid::new_v4());
         let language = request.language_or_unknown();
@@ -313,6 +328,7 @@ impl CompletionService {
                 .build_snippets(
                     &language,
                     segments,
+                    allowed_code_repository,
                     request.disable_retrieval_augmented_code_completion(),
                 )
                 .await;
@@ -338,7 +354,7 @@ impl CompletionService {
                     index: 0,
                     text: text.clone(),
                 }],
-                user_agent: user_agent.to_string(),
+                user_agent: user_agent.map(|x| x.to_owned()),
             },
         );
 
@@ -430,7 +446,7 @@ mod tests {
     }
 
     fn mock_completion_service() -> CompletionService {
-        let generation = CodeGeneration::new(Arc::new(MockCompletionStream));
+        let generation = CodeGeneration::new(Arc::new(MockCompletionStream), None);
         CompletionService::new(
             CompletionConfig::default(),
             Arc::new(generation),
@@ -450,6 +466,7 @@ mod tests {
             git_url: None,
             declarations: None,
             relevant_snippets_from_changed_files: None,
+            relevant_snippets_from_recently_opened_files: None,
             clipboard: None,
         };
         let request = CompletionRequest {
@@ -461,8 +478,9 @@ mod tests {
             seed: None,
         };
 
+        let allowed_code_repository = AllowedCodeRepository::default();
         let response = completion_service
-            .generate(&request, "test user agent")
+            .generate(&request, &allowed_code_repository, Some("test user agent"))
             .await
             .unwrap();
         assert_eq!(response.choices[0].text, r#""Hello, world!""#);
