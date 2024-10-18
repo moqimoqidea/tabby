@@ -7,7 +7,7 @@
   "repository": "https://github.com/TabbyML/tabby",
   "bugs": "https://github.com/TabbyML/tabby/issues",
   "license": "Apache-2.0",
-  "version": "1.9.0-dev",
+  "version": "1.13.0-dev",
   "keywords": [
     "ai",
     "autocomplete",
@@ -139,6 +139,11 @@
         "command": "tabby.server.selectPastServerConfig",
         "title": "Select Server Endpoint from History",
         "category": "Tabby"
+      },
+      {
+        "command": "tabby.chat.createPanel",
+        "title": "Open Chat in Editor",
+        "category": "Tabby"
       }
     ],
     "submenus": [
@@ -217,6 +222,12 @@
           "command": "tabby.chat.generateCommitMessage",
           "when": "tabby.chatEnabled",
           "group": "navigation@-1"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "tabby.chat.createPanel",
+          "when": "view == tabby.chatView"
         }
       ]
     },
@@ -399,20 +410,26 @@
         "command": "tabby.chatView.focus",
         "key": "ctrl+l",
         "mac": "cmd+l",
-        "when": "!editorHasSelection && tabby.chatEnabled && !tabby.chatViewVisible"
+        "when": "!editorHasSelection && editorTextFocus && tabby.chatEnabled"
+      },
+      {
+        "command": "workbench.action.focusActiveEditorGroup",
+        "key": "ctrl+l",
+        "mac": "cmd+l",
+        "when": "!editorFocus && focusedView == 'tabby.chatView'"
       }
     ],
     "viewsContainers": {
       "activitybar": [
         {
-          "id": "chatView",
+          "id": "tabbyChatView",
           "title": "Tabby",
           "icon": "assets/chat.svg"
         }
       ]
     },
     "views": {
-      "chatView": [
+      "tabbyChatView": [
         {
           "type": "webview",
           "id": "tabby.chatView",
@@ -423,9 +440,10 @@
     }
   },
   "scripts": {
-    "build": "tsc --noEmit && tsup --minify",
+    "build": "tsc -p ./tsconfig.build.json --noEmit && tsup --minify",
     "watch": "tsc-watch --noEmit --onSuccess \"tsup\"",
     "dev": "code --extensionDevelopmentPath=$PWD --disable-extensions && pnpm watch",
+    "vscode:dev": "pnpm run dev",
     "dev:browser": "vscode-test-web --extensionDevelopmentPath=$PWD --browserType=chromium --port=3000 && pnpm watch",
     "lint": "eslint --ext .ts ./src && prettier --check .",
     "lint:fix": "eslint --fix --ext .ts ./src && prettier --write .",
@@ -433,11 +451,17 @@
     "vscode:package": "vsce package --no-dependencies",
     "vscode:prepublish": "turbo build --force",
     "vscode:publish": "vsce publish --no-dependencies",
-    "vscode:publish-prerelease": "vsce publish --no-dependencies --pre-release"
+    "vscode:publish-prerelease": "vsce publish --no-dependencies --pre-release",
+    "ovsx:publish": "ovsx publish --no-dependencies --pat $OVSX_PAT",
+    "ovsx:publish-prerelease": "ovsx publish --no-dependencies --pre-release --pat $OVSX_PAT",
+    "package": "pnpm run vscode:package",
+    "publish": "pnpm run vscode:publish && pnpm run ovsx:publish",
+    "publish-prerelease": "pnpm run vscode:publish-prerelease && pnpm run ovsx:publish-prerelease"
   },
   "devDependencies": {
     "@quilted/threads": "^2.2.0",
     "@types/deep-equal": "^1.0.4",
+    "@types/diff": "^5.2.1",
     "@types/mocha": "^10.0.1",
     "@types/node": "18.x",
     "@types/object-hash": "^3.0.0",
@@ -451,12 +475,14 @@
     "assert": "^2.0.0",
     "dedent": "^0.7.0",
     "deep-equal": "^2.2.1",
+    "diff": "^5.2.0",
     "esbuild-plugin-copy": "^2.1.1",
     "esbuild-plugin-polyfill-node": "^0.3.0",
     "eslint": "^8.55.0",
     "eslint-config-prettier": "^9.0.0",
     "get-installed-path": "^4.0.8",
     "object-hash": "^3.0.0",
+    "ovsx": "^0.9.5",
     "prettier": "^3.0.0",
     "semver": "^7.6.0",
     "tabby-agent": "workspace:*",

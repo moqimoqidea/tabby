@@ -6,28 +6,27 @@ import {
   ExtensionContext,
   CancellationTokenSource,
   Uri,
-  Position,
-  Selection,
   Disposable,
   InputBoxValidationSeverity,
   ProgressLocation,
   ThemeIcon,
   QuickPickItem,
-  QuickPickItemKind,
+  ViewColumn,
 } from "vscode";
 import os from "os";
 import path from "path";
 import { strict as assert } from "assert";
-import { ChatEditCommand } from "tabby-agent";
 import { Client } from "./lsp/Client";
 import { Config, PastServerConfig } from "./Config";
 import { ContextVariables } from "./ContextVariables";
 import { InlineCompletionProvider } from "./InlineCompletionProvider";
-import { ChatViewProvider } from "./chat/ChatViewProvider";
+import { ChatSideViewProvider } from "./chat/ChatSideViewProvider";
+import { ChatPanelViewProvider } from "./chat/ChatPanelViewProvider";
 import { GitProvider, Repository } from "./git/GitProvider";
 import CommandPalette from "./CommandPalette";
 import { showOutputPanel } from "./logger";
 import { Issues } from "./Issues";
+import { InlineEditController } from "./inline-edit";
 
 export class Commands {
   private chatEditCancellationTokenSource: CancellationTokenSource | null = null;
@@ -39,7 +38,7 @@ export class Commands {
     private readonly issues: Issues,
     private readonly contextVariables: ContextVariables,
     private readonly inlineCompletionProvider: InlineCompletionProvider,
-    private readonly chatViewProvider: ChatViewProvider,
+    private readonly chatViewProvider: ChatSideViewProvider,
     private readonly gitProvider: GitProvider,
   ) {
     const registrations = Object.keys(this.commands).map((key) => {
@@ -58,7 +57,7 @@ export class Commands {
     const editor = window.activeTextEditor;
     if (editor) {
       commands.executeCommand("tabby.chatView.focus");
-      const fileContext = ChatViewProvider.getFileContextFromSelection({ editor, gitProvider: this.gitProvider });
+      const fileContext = ChatSideViewProvider.getFileContextFromSelection({ editor, gitProvider: this.gitProvider });
       if (!fileContext) {
         window.showInformationMessage("No selected codes");
         return;
@@ -80,20 +79,14 @@ export class Commands {
       return;
     }
 
-    // If chat webview is not created or not visible, we shall focus on it.
-    const focusChat = !this.chatViewProvider.webview?.visible;
     const addContext = () => {
-      const fileContext = ChatViewProvider.getFileContextFromSelection({ editor, gitProvider: this.gitProvider });
+      const fileContext = ChatSideViewProvider.getFileContextFromSelection({ editor, gitProvider: this.gitProvider });
       if (fileContext) {
         this.chatViewProvider.addRelevantContext(fileContext);
       }
     };
 
-    if (focusChat) {
-      commands.executeCommand("tabby.chatView.focus").then(addContext);
-    } else {
-      addContext();
-    }
+    commands.executeCommand("tabby.chatView.focus").then(addContext);
   }
 
   commands: Record<string, (...args: never[]) => void> = {
@@ -259,8 +252,8 @@ export class Commands {
         this.config.mutedNotifications = [];
       }
     },
-    "chat.explainCodeBlock": async () => {
-      this.sendMessageToChatPanel("Explain the selected code:");
+    "chat.explainCodeBlock": async (userCommand?: string) => {
+      this.sendMessageToChatPanel("Explain the selected code:".concat(userCommand ? `\n${userCommand}` : ""));
     },
     "chat.addRelevantContext": async () => {
       this.addRelevantContext();
@@ -269,7 +262,7 @@ export class Commands {
       const editor = window.activeTextEditor;
       if (editor) {
         commands.executeCommand("tabby.chatView.focus").then(() => {
-          const fileContext = ChatViewProvider.getFileContextFromEditor({ editor, gitProvider: this.gitProvider });
+          const fileContext = ChatSideViewProvider.getFileContextFromEditor({ editor, gitProvider: this.gitProvider });
           this.chatViewProvider.addRelevantContext(fileContext);
         });
       } else {
@@ -285,12 +278,21 @@ export class Commands {
     "chat.generateCodeBlockTest": async () => {
       this.sendMessageToChatPanel("Generate a unit test for the selected code:");
     },
-    "chat.edit.start": async () => {
+    "chat.createPanel": async () => {
+      const panel = window.createWebviewPanel("tabby.chatView", "Tabby", ViewColumn.One, {
+        retainContextWhenHidden: true,
+      });
+
+      const chatPanelViewProvider = new ChatPanelViewProvider(this.context, this.client.agent, this.gitProvider);
+
+      chatPanelViewProvider.resolveWebviewView(panel);
+    },
+    "chat.edit.start": async (userCommand?: string) => {
       const editor = window.activeTextEditor;
       if (!editor) {
         return;
       }
-      const startPosition = new Position(editor.selection.start.line, 0);
+
       const editLocation = {
         uri: editor.document.uri.toString(),
         range: {
@@ -301,138 +303,16 @@ export class Commands {
           },
         },
       };
-      //ensure max length
-      const recentlyCommand = this.config.chatEditRecentlyCommand.slice(0, this.config.maxChatEditHistory);
-      const suggestedCommand: ChatEditCommand[] = [];
-      const quickPick = window.createQuickPick<QuickPickItem & { value: string }>();
 
-      const updateQuickPickList = () => {
-        const input = quickPick.value;
-        const list: (QuickPickItem & { value: string })[] = [];
-        list.push(
-          ...suggestedCommand.map((item) => ({
-            label: item.label,
-            value: item.command,
-            iconPath: item.source === "preset" ? new ThemeIcon("run") : new ThemeIcon("spark"),
-            description: item.source === "preset" ? item.command : "Suggested",
-          })),
-        );
-        if (list.length > 0) {
-          list.push({
-            label: "",
-            value: "",
-            kind: QuickPickItemKind.Separator,
-            alwaysShow: true,
-          });
-        }
-        const recentlyCommandToAdd = recentlyCommand.filter((item) => !list.find((i) => i.value === item));
-        list.push(
-          ...recentlyCommandToAdd.map((item) => ({
-            label: item,
-            value: item,
-            iconPath: new ThemeIcon("history"),
-            description: "History",
-            buttons: [
-              {
-                iconPath: new ThemeIcon("edit"),
-              },
-              {
-                iconPath: new ThemeIcon("settings-remove"),
-              },
-            ],
-          })),
-        );
-        if (input.length > 0 && !list.find((i) => i.value === input)) {
-          list.unshift({
-            label: input,
-            value: input,
-            iconPath: new ThemeIcon("run"),
-            description: "",
-            alwaysShow: true,
-          });
-        }
-        quickPick.items = list;
-      };
-
-      const fetchingSuggestedCommandCancellationTokenSource = new CancellationTokenSource();
-      this.client.chat.provideEditCommands(
-        { location: editLocation },
-        { commands: suggestedCommand, callback: () => updateQuickPickList() },
-        fetchingSuggestedCommandCancellationTokenSource.token,
+      const inlineEditController = new InlineEditController(
+        this.client,
+        this.config,
+        this.contextVariables,
+        editor,
+        editLocation,
+        userCommand,
       );
-
-      quickPick.placeholder = "Enter the command for editing";
-      quickPick.matchOnDescription = true;
-      quickPick.onDidChangeValue(() => updateQuickPickList());
-      quickPick.onDidHide(() => {
-        fetchingSuggestedCommandCancellationTokenSource.cancel();
-      });
-      quickPick.onDidAccept(() => {
-        quickPick.hide();
-        const command = quickPick.selectedItems[0]?.value;
-        if (command) {
-          const updatedRecentlyCommand = [command]
-            .concat(recentlyCommand.filter((item) => item !== command))
-            .slice(0, this.config.maxChatEditHistory);
-          this.config.chatEditRecentlyCommand = updatedRecentlyCommand;
-
-          window.withProgress(
-            {
-              location: ProgressLocation.Notification,
-              title: "Editing in progress...",
-              cancellable: true,
-            },
-            async (_, token) => {
-              editor.selection = new Selection(startPosition, startPosition);
-              this.contextVariables.chatEditInProgress = true;
-              if (token.isCancellationRequested) {
-                return;
-              }
-              this.chatEditCancellationTokenSource = new CancellationTokenSource();
-              token.onCancellationRequested(() => {
-                this.chatEditCancellationTokenSource?.cancel();
-              });
-              try {
-                await this.client.chat.provideEdit(
-                  {
-                    location: editLocation,
-                    command,
-                    format: "previewChanges",
-                  },
-                  this.chatEditCancellationTokenSource.token,
-                );
-              } catch (error) {
-                if (typeof error === "object" && error && "message" in error && typeof error["message"] === "string") {
-                  window.showErrorMessage(error["message"]);
-                }
-              }
-              this.chatEditCancellationTokenSource.dispose();
-              this.chatEditCancellationTokenSource = null;
-              this.contextVariables.chatEditInProgress = false;
-              editor.selection = new Selection(startPosition, startPosition);
-            },
-          );
-        }
-      });
-
-      quickPick.onDidTriggerItemButton((event) => {
-        const item = event.item;
-        const button = event.button;
-        if (button.iconPath instanceof ThemeIcon && button.iconPath.id === "settings-remove") {
-          const index = recentlyCommand.indexOf(item.value);
-          if (index !== -1) {
-            recentlyCommand.splice(index, 1);
-            this.config.chatEditRecentlyCommand = recentlyCommand;
-            updateQuickPickList();
-          }
-        }
-
-        if (button.iconPath instanceof ThemeIcon && button.iconPath.id === "edit") {
-          quickPick.value = item.value;
-        }
-      });
-
-      quickPick.show();
+      inlineEditController.start();
     },
     "chat.edit.stop": async () => {
       this.chatEditCancellationTokenSource?.cancel();

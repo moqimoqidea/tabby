@@ -8,8 +8,6 @@ import org.eclipse.core.runtime.Platform;
 import org.eclipse.jface.resource.ImageDescriptor;
 import org.eclipse.jface.resource.ImageRegistry;
 import org.eclipse.swt.graphics.Image;
-import org.eclipse.swt.graphics.RGB;
-import org.eclipse.ui.PlatformUI;
 import org.osgi.framework.Bundle;
 
 public class Images {
@@ -21,6 +19,7 @@ public class Images {
 	public static final String ICON_ERROR = "hprio_tsk.png";
 	public static final String ICON_WARN = "warn_tsk.png";
 	public static final String ICON_LOADING = "progress_task.png";
+	public static final String ICON_SETTINGS = "settings.png";
 
 	public static Image getIcon(String filename) {
 		Image icon = icons.get(filename);

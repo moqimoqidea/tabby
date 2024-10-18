@@ -1,26 +1,32 @@
+pub mod access_policy;
 pub mod analytic;
 pub mod auth;
 pub mod constants;
+pub mod context;
 pub mod email;
 pub mod integration;
+pub mod interface;
 pub mod job;
 pub mod license;
 pub mod repository;
 pub mod setting;
 pub mod thread;
 pub mod user_event;
-pub mod web_crawler;
+pub mod user_group;
 pub mod web_documents;
 pub mod worker;
 
 use std::sync::Arc;
 
+use access_policy::{AccessPolicyService, SourceIdAccessPolicy};
 use auth::{
     AuthenticationService, Invitation, RefreshTokenResponse, RegisterResponse, TokenAuthResponse,
-    User,
+    UserSecured,
 };
 use base64::Engine;
 use chrono::{DateTime, Utc};
+use context::{ContextInfo, ContextService};
+use interface::UserValue;
 use job::{JobRun, JobService};
 use juniper::{
     graphql_object, graphql_subscription, graphql_value, FieldError, GraphQLObject, IntoFieldError,
@@ -30,6 +36,9 @@ use repository::RepositoryGrepOutput;
 use tabby_common::api::{code::CodeSearch, event::EventLogger};
 use thread::{CreateThreadAndRunInput, CreateThreadRunInput, ThreadRunStream, ThreadService};
 use tracing::{error, warn};
+use user_group::{
+    CreateUserGroupInput, UpsertUserGroupMembershipInput, UserGroup, UserGroupService,
+};
 use validator::{Validate, ValidationErrors};
 use worker::WorkerService;
 
@@ -51,7 +60,6 @@ use self::{
         NetworkSetting, NetworkSettingInput, SecuritySetting, SecuritySettingInput, SettingService,
     },
     user_event::{UserEvent, UserEventService},
-    web_crawler::{CreateWebCrawlerUrlInput, WebCrawlerService, WebCrawlerUrl},
     web_documents::{CreateCustomDocumentInput, CustomWebDocument, WebDocumentService},
 };
 use crate::{
@@ -73,9 +81,11 @@ pub trait ServiceLocator: Send + Sync {
     fn license(&self) -> Arc<dyn LicenseService>;
     fn analytic(&self) -> Arc<dyn AnalyticService>;
     fn user_event(&self) -> Arc<dyn UserEventService>;
-    fn web_crawler(&self) -> Arc<dyn WebCrawlerService>;
     fn web_documents(&self) -> Arc<dyn WebDocumentService>;
     fn thread(&self) -> Arc<dyn ThreadService>;
+    fn context(&self) -> Arc<dyn ContextService>;
+    fn user_group(&self) -> Arc<dyn UserGroupService>;
+    fn access_policy(&self) -> Arc<dyn AccessPolicyService>;
 }
 
 pub struct Context {
@@ -95,6 +105,9 @@ pub enum CoreError {
 
     #[error("{0}")]
     Forbidden(&'static str),
+
+    #[error("{0}")]
+    NotFound(&'static str),
 
     #[error("Invalid ID")]
     InvalidID,
@@ -119,6 +132,7 @@ impl<S: ScalarValue> IntoFieldError<S> for CoreError {
             Self::Unauthorized(msg) => {
                 FieldError::new(msg, graphql_value!({"code": "UNAUTHORIZED"}))
             }
+            Self::NotFound(msg) => FieldError::new(msg, graphql_value!({"code": "NOT_FOUND"})),
             Self::InvalidInput(errors) => from_validation_errors(errors),
             _ => self.into(),
         }
@@ -140,18 +154,18 @@ async fn check_admin(ctx: &Context) -> Result<(), CoreError> {
     Ok(())
 }
 
-async fn check_user(ctx: &Context) -> Result<User, CoreError> {
+async fn check_user(ctx: &Context) -> Result<UserSecured, CoreError> {
     check_user_and_auth_token(ctx, false).await
 }
 
-async fn check_user_allow_auth_token(ctx: &Context) -> Result<User, CoreError> {
+async fn check_user_allow_auth_token(ctx: &Context) -> Result<UserSecured, CoreError> {
     check_user_and_auth_token(ctx, true).await
 }
 
 async fn check_user_and_auth_token(
     ctx: &Context,
     allow_auth_token: bool,
-) -> Result<User, CoreError> {
+) -> Result<UserSecured, CoreError> {
     let claims = check_claims(ctx)?;
     if !allow_auth_token && claims.is_generated_from_auth_token {
         return Err(CoreError::Forbidden(
@@ -184,19 +198,19 @@ impl Query {
         ctx.locator.worker().read_registration_token().await
     }
 
-    async fn me(ctx: &Context) -> Result<User> {
-        let claims = check_claims(ctx)?;
-        ctx.locator.auth().get_user(&claims.sub).await
+    async fn me(ctx: &Context) -> Result<UserSecured> {
+        check_user_allow_auth_token(ctx).await
     }
 
+    /// List users, accessible for all login users.
     async fn users(
         ctx: &Context,
         after: Option<String>,
         before: Option<String>,
         first: Option<i32>,
         last: Option<i32>,
-    ) -> Result<Connection<User>> {
-        check_admin(ctx).await?;
+    ) -> Result<Connection<UserValue>> {
+        check_user(ctx).await?;
         relay::query_async(
             after,
             before,
@@ -207,6 +221,7 @@ impl Query {
                     .auth()
                     .list_users(after, before, first, last)
                     .await
+                    .map(|users| users.into_iter().map(UserValue::UserSecured).collect())
             },
         )
         .await
@@ -312,10 +327,10 @@ impl Query {
         rev: Option<String>,
         pattern: String,
     ) -> Result<Vec<FileEntrySearchResult>> {
-        check_claims(ctx)?;
+        let user = check_user(ctx).await?;
         ctx.locator
             .repository()
-            .search_files(&kind, &id, rev.as_deref(), &pattern, 40)
+            .search_files(&user.policy, &kind, &id, rev.as_deref(), &pattern, 40)
             .await
     }
 
@@ -338,13 +353,13 @@ impl Query {
         rev: Option<String>,
         query: String,
     ) -> Result<RepositoryGrepOutput> {
-        check_claims(ctx)?;
+        let user = check_user(ctx).await?;
 
         let start_time = chrono::offset::Utc::now();
         let files = ctx
             .locator
             .repository()
-            .grep(&kind, &id, rev.as_deref(), &query, 40)
+            .grep(&user.policy, &kind, &id, rev.as_deref(), &query, 40)
             .await?;
         let end_time = chrono::offset::Utc::now();
         let elapsed_ms = (end_time - start_time).num_milliseconds() as i32;
@@ -393,7 +408,8 @@ impl Query {
         users: Option<Vec<ID>>,
     ) -> Result<Vec<CompletionStats>> {
         let users = users.unwrap_or_default();
-        check_analytic_access(ctx, &users).await?;
+        let user = check_user(ctx).await?;
+        user.policy.check_read_analytic(&users)?;
         ctx.locator.analytic().daily_stats_in_past_year(users).await
     }
 
@@ -405,7 +421,8 @@ impl Query {
         languages: Option<Vec<analytic::Language>>,
     ) -> Result<Vec<CompletionStats>> {
         let users = users.unwrap_or_default();
-        check_analytic_access(ctx, &users).await?;
+        let user = check_user(ctx).await?;
+        user.policy.check_read_analytic(&users)?;
         ctx.locator
             .analytic()
             .daily_stats(start, end, users, languages.unwrap_or_default())
@@ -456,9 +473,17 @@ impl Query {
     }
 
     async fn repository_list(ctx: &Context) -> Result<Vec<Repository>> {
-        check_user(ctx).await?;
+        let user = check_user(ctx).await?;
 
-        ctx.locator.repository().repository_list().await
+        ctx.locator
+            .repository()
+            .repository_list(Some(&user.policy))
+            .await
+    }
+
+    async fn context_info(ctx: &Context) -> Result<ContextInfo> {
+        let user = check_user(ctx).await?;
+        ctx.locator.context().read(Some(&user.policy)).await
     }
 
     async fn integrations(
@@ -470,6 +495,7 @@ impl Query {
         first: Option<i32>,
         last: Option<i32>,
     ) -> Result<Connection<Integration>> {
+        check_admin(ctx).await?;
         query_async(
             after,
             before,
@@ -495,6 +521,7 @@ impl Query {
         first: Option<i32>,
         last: Option<i32>,
     ) -> Result<Connection<ProvidedRepository>> {
+        check_admin(ctx).await?;
         query_async(
             after,
             before,
@@ -511,31 +538,10 @@ impl Query {
         .await
     }
 
-    async fn web_crawler_urls(
-        ctx: &Context,
-        after: Option<String>,
-        before: Option<String>,
-        first: Option<i32>,
-        last: Option<i32>,
-    ) -> Result<Connection<WebCrawlerUrl>> {
-        query_async(
-            after,
-            before,
-            first,
-            last,
-            |after, before, first, last| async move {
-                ctx.locator
-                    .web_crawler()
-                    .list_web_crawler_urls(after, before, first, last)
-                    .await
-            },
-        )
-        .await
-    }
-
     async fn threads(
         ctx: &Context,
         ids: Option<Vec<ID>>,
+        is_ephemeral: Option<bool>,
         after: Option<String>,
         before: Option<String>,
         first: Option<i32>,
@@ -550,7 +556,7 @@ impl Query {
             |after, before, first, last| async move {
                 ctx.locator
                     .thread()
-                    .list(ids.as_deref(), after, before, first, last)
+                    .list(ids.as_deref(), is_ephemeral, after, before, first, last)
                     .await
             },
         )
@@ -587,11 +593,13 @@ impl Query {
 
     async fn custom_web_documents(
         ctx: &Context,
+        ids: Option<Vec<ID>>,
         after: Option<String>,
         before: Option<String>,
         first: Option<i32>,
         last: Option<i32>,
     ) -> Result<Connection<CustomWebDocument>> {
+        check_admin(ctx).await?;
         query_async(
             after,
             before,
@@ -600,7 +608,7 @@ impl Query {
             |after, before, first, last| async move {
                 ctx.locator
                     .web_documents()
-                    .list_custom_web_documents(after, before, first, last)
+                    .list_custom_web_documents(ids, after, before, first, last)
                     .await
             },
         )
@@ -608,12 +616,14 @@ impl Query {
     }
     async fn preset_web_documents(
         ctx: &Context,
+        ids: Option<Vec<ID>>,
         after: Option<String>,
         before: Option<String>,
         first: Option<i32>,
         last: Option<i32>,
-        is_active: bool,
+        is_active: Option<bool>,
     ) -> Result<Connection<PresetWebDocument>> {
+        check_admin(ctx).await?;
         query_async(
             after,
             before,
@@ -622,11 +632,31 @@ impl Query {
             |after, before, first, last| async move {
                 ctx.locator
                     .web_documents()
-                    .list_preset_web_documents(after, before, first, last, is_active)
+                    .list_preset_web_documents(ids, after, before, first, last, is_active)
                     .await
             },
         )
         .await
+    }
+
+    /// List user groups.
+    async fn user_groups(ctx: &Context) -> Result<Vec<UserGroup>> {
+        check_user(ctx).await?;
+        ctx.locator.user_group().list().await
+    }
+
+    async fn source_id_access_policies(
+        ctx: &Context,
+        source_id: String,
+    ) -> Result<SourceIdAccessPolicy> {
+        check_admin(ctx).await?;
+        let read = ctx
+            .locator
+            .access_policy()
+            .list_source_id_read_access(&source_id)
+            .await?;
+
+        Ok(SourceIdAccessPolicy { source_id, read })
     }
 }
 
@@ -655,6 +685,14 @@ impl Mutation {
     ) -> Result<Invitation> {
         input.validate()?;
         ctx.locator.auth().request_invitation_email(input).await
+    }
+
+    async fn generate_reset_password_url(ctx: &Context, user_id: ID) -> Result<String> {
+        check_admin(ctx).await?;
+        ctx.locator
+            .auth()
+            .generate_reset_password_url(&user_id)
+            .await
     }
 
     async fn request_password_reset_email(
@@ -910,6 +948,7 @@ impl Mutation {
     }
 
     async fn create_integration(ctx: &Context, input: CreateIntegrationInput) -> Result<ID> {
+        check_admin(ctx).await?;
         input.validate()?;
         let id = ctx
             .locator
@@ -925,6 +964,7 @@ impl Mutation {
     }
 
     async fn update_integration(ctx: &Context, input: UpdateIntegrationInput) -> Result<bool> {
+        check_admin(ctx).await?;
         input.validate()?;
         ctx.locator
             .integration()
@@ -940,6 +980,7 @@ impl Mutation {
     }
 
     async fn delete_integration(ctx: &Context, id: ID, kind: IntegrationKind) -> Result<bool> {
+        check_admin(ctx).await?;
         ctx.locator
             .integration()
             .delete_integration(id, kind)
@@ -952,6 +993,7 @@ impl Mutation {
         id: ID,
         active: bool,
     ) -> Result<bool> {
+        check_admin(ctx).await?;
         ctx.locator
             .repository()
             .third_party()
@@ -966,21 +1008,6 @@ impl Mutation {
         ctx.locator.job().trigger(command).await
     }
 
-    async fn create_web_crawler_url(ctx: &Context, input: CreateWebCrawlerUrlInput) -> Result<ID> {
-        input.validate()?;
-        let id = ctx
-            .locator
-            .web_crawler()
-            .create_web_crawler_url(input.url)
-            .await?;
-        Ok(id)
-    }
-
-    async fn delete_web_crawler_url(ctx: &Context, id: ID) -> Result<bool> {
-        ctx.locator.web_crawler().delete_web_crawler_url(id).await?;
-        Ok(true)
-    }
-
     /// Delete pair of user message and bot response in a thread.
     async fn delete_thread_message_pair(
         ctx: &Context,
@@ -988,18 +1015,13 @@ impl Mutation {
         user_message_id: ID,
         assistant_message_id: ID,
     ) -> Result<bool> {
-        // ast-grep-ignore: use-schema-result
-        use anyhow::Context;
-
         let user = check_user_allow_auth_token(ctx).await?;
         let svc = ctx.locator.thread();
-        let thread = svc.get(&thread_id).await?.context("Thread not found")?;
+        let Some(thread) = svc.get(&thread_id).await? else {
+            return Err(CoreError::NotFound("Thread not found"));
+        };
 
-        if thread.user_id != user.id {
-            return Err(CoreError::Forbidden(
-                "You must be the thread owner to delete the latest message pair",
-            ));
-        }
+        user.policy.check_delete_thread_messages(&thread.user_id)?;
 
         ctx.locator
             .thread()
@@ -1010,24 +1032,21 @@ impl Mutation {
 
     /// Turn on persisted status for a thread.
     async fn set_thread_persisted(ctx: &Context, thread_id: ID) -> Result<bool> {
-        // ast-grep-ignore: use-schema-result
-        use anyhow::Context;
-
         let user = check_user(ctx).await?;
         let svc = ctx.locator.thread();
-        let thread = svc.get(&thread_id).await?.context("Thread not found")?;
+        let Some(thread) = svc.get(&thread_id).await? else {
+            return Err(CoreError::NotFound("Thread not found"));
+        };
 
-        if thread.user_id != user.id {
-            return Err(CoreError::Forbidden(
-                "You must be the thread owner to set persisted status",
-            ));
-        }
+        user.policy
+            .check_update_thread_persistence(&thread.user_id)?;
 
         ctx.locator.thread().set_persisted(&thread_id).await?;
         Ok(true)
     }
 
     async fn create_custom_document(ctx: &Context, input: CreateCustomDocumentInput) -> Result<ID> {
+        check_admin(ctx).await?;
         input.validate()?;
         let id = ctx
             .locator
@@ -1038,6 +1057,7 @@ impl Mutation {
     }
 
     async fn delete_custom_document(ctx: &Context, id: ID) -> Result<bool> {
+        check_admin(ctx).await?;
         ctx.locator
             .web_documents()
             .delete_custom_web_document(id)
@@ -1049,34 +1069,84 @@ impl Mutation {
         ctx: &Context,
         input: SetPresetDocumentActiveInput,
     ) -> Result<bool> {
+        check_admin(ctx).await?;
         input.validate()?;
         ctx.locator
             .web_documents()
-            .set_preset_web_documents_active(input.name, input.active)
+            .set_preset_web_documents_active(input.id, input.active)
             .await?;
         Ok(true)
     }
-}
 
-async fn check_analytic_access(ctx: &Context, users: &[ID]) -> Result<(), CoreError> {
-    let user = check_user(ctx).await?;
-    if users.is_empty() && !user.is_admin {
-        return Err(CoreError::Forbidden(
-            "You must be admin to read other users' data",
-        ));
+    async fn create_user_group(ctx: &Context, input: CreateUserGroupInput) -> Result<ID> {
+        check_admin(ctx).await?;
+        input.validate()?;
+        let id = ctx.locator.user_group().create(&input).await?;
+        Ok(id)
     }
 
-    if !user.is_admin {
-        for id in users {
-            if user.id != *id {
-                return Err(CoreError::Forbidden(
-                    "You must be admin to read other users' data",
-                ));
-            }
-        }
+    async fn delete_user_group(ctx: &Context, id: ID) -> Result<bool> {
+        check_admin(ctx).await?;
+        ctx.locator.user_group().delete(&id).await?;
+        Ok(true)
     }
 
-    Ok(())
+    async fn upsert_user_group_membership(
+        ctx: &Context,
+        input: UpsertUserGroupMembershipInput,
+    ) -> Result<bool> {
+        let user = check_user(ctx).await?;
+        user.policy
+            .check_upsert_user_group_membership(&input)
+            .await?;
+
+        input.validate()?;
+        ctx.locator.user_group().upsert_membership(&input).await?;
+        Ok(true)
+    }
+
+    async fn delete_user_group_membership(
+        ctx: &Context,
+        user_group_id: ID,
+        user_id: ID,
+    ) -> Result<bool> {
+        let user = check_user(ctx).await?;
+        user.policy
+            .check_delete_user_group_membership(&user_group_id, &user_id)
+            .await?;
+
+        ctx.locator
+            .user_group()
+            .delete_membership(&user_group_id, &user_id)
+            .await?;
+        Ok(true)
+    }
+
+    async fn grant_source_id_read_access(
+        ctx: &Context,
+        source_id: String,
+        user_group_id: ID,
+    ) -> Result<bool> {
+        check_admin(ctx).await?;
+        ctx.locator
+            .access_policy()
+            .grant_source_id_read_access(&source_id, &user_group_id)
+            .await?;
+        Ok(true)
+    }
+
+    async fn revoke_source_id_read_access(
+        ctx: &Context,
+        source_id: String,
+        user_group_id: ID,
+    ) -> Result<bool> {
+        check_admin(ctx).await?;
+        ctx.locator
+            .access_policy()
+            .revoke_source_id_read_access(&source_id, &user_group_id)
+            .await?;
+        Ok(true)
+    }
 }
 
 fn from_validation_errors<S: ScalarValue>(error: ValidationErrors) -> FieldError<S> {
@@ -1104,7 +1174,7 @@ fn from_validation_errors<S: ScalarValue>(error: ValidationErrors) -> FieldError
         validator::ValidationErrorsKind::Field(e) => {
             for error in e {
                 let mut obj = Object::with_capacity(2);
-                obj.add_field("path", Value::scalar(field.to_string()));
+                obj.add_field("path", Value::scalar(error.code.to_string()));
                 obj.add_field(
                     "message",
                     Value::scalar(error.message.clone().unwrap_or_default().to_string()),
@@ -1141,6 +1211,7 @@ impl Subscription {
 
         thread
             .create_run(
+                &user.policy,
                 &thread_id,
                 &input.options,
                 input.thread.user_message.attachments.as_ref(),
@@ -1154,17 +1225,13 @@ impl Subscription {
         ctx: &Context,
         input: CreateThreadRunInput,
     ) -> Result<ThreadRunStream> {
-        // ast-grep-ignore: use-schema-result
-        use anyhow::Context;
-
         let user = check_user_allow_auth_token(ctx).await?;
         input.validate()?;
 
         let svc = ctx.locator.thread();
-        let thread = svc
-            .get(&input.thread_id)
-            .await?
-            .context("Thread not found")?;
+        let Some(thread) = svc.get(&input.thread_id).await? else {
+            return Err(CoreError::NotFound("Thread not found"));
+        };
 
         if thread.user_id != user.id {
             return Err(CoreError::Forbidden(
@@ -1176,6 +1243,7 @@ impl Subscription {
             .await?;
 
         svc.create_run(
+            &user.policy,
             &input.thread_id,
             &input.options,
             input.additional_user_message.attachments.as_ref(),
