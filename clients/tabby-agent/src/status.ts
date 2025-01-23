@@ -1,10 +1,11 @@
 import type { Connection } from "vscode-languageserver";
 import type { Feature } from "./feature";
-import type { DataStore } from "./dataStore";
+import type { DataStore, StoredData } from "./dataStore";
 import type { Configurations } from "./config";
 import type { TabbyApiClient } from "./http/tabbyApiClient";
 import { EventEmitter } from "events";
 import { ShowMessageRequest, ShowMessageRequestParams, MessageType } from "vscode-languageserver";
+import deepEqual from "deep-equal";
 import {
   ClientCapabilities,
   ServerCapabilities,
@@ -40,9 +41,10 @@ export class StatusProvider extends EventEmitter implements Feature {
 
     connection.onRequest(StatusRequest.type, async (params) => {
       if (params?.recheckConnection) {
-        await this.tabbyApiClient.connect();
+        await this.configurations.refreshClientProvidedConfig();
+        await this.tabbyApiClient.connect({ reset: true });
       }
-      return this.getStatusInfo();
+      return this.buildStatusInfo({ includeHelpMessage: true });
     });
     connection.onRequest(StatusShowHelpMessageRequest.type, async () => {
       return this.showStatusHelpMessage();
@@ -68,6 +70,9 @@ export class StatusProvider extends EventEmitter implements Feature {
     this.tabbyApiClient.on("hasCompletionResponseTimeIssueUpdated", async () => {
       this.notify();
     });
+    this.tabbyApiClient.on("isRateLimitExceededUpdated", async () => {
+      this.notify();
+    });
 
     this.configurations.on(
       "clientProvidedConfigUpdated",
@@ -78,23 +83,25 @@ export class StatusProvider extends EventEmitter implements Feature {
       },
     );
 
+    this.dataStore.on("updated", async (data: Partial<StoredData>, old: Partial<StoredData>) => {
+      if (!deepEqual(data.statusIgnoredIssues, old.statusIgnoredIssues)) {
+        this.notify();
+      }
+    });
+
     return {};
   }
 
   async initialized(connection: Connection): Promise<void> {
     if (this.clientCapabilities?.tabby?.statusDidChangeListener) {
-      const statusInfo = await this.getStatusInfo();
+      const statusInfo = await this.buildStatusInfo();
       connection.sendNotification(StatusDidChangeNotification.type, statusInfo);
     }
   }
 
   private async notify() {
-    const statusInfo = await this.getStatusInfo();
+    const statusInfo = await this.buildStatusInfo();
     this.emit("updated", statusInfo);
-  }
-
-  getStatusInfo(): StatusInfo {
-    return this.buildStatusInfo();
   }
 
   async showStatusHelpMessage(): Promise<boolean | null> {
@@ -147,52 +154,46 @@ export class StatusProvider extends EventEmitter implements Feature {
     const issues = Array.isArray(params.issues) ? params.issues : [params.issues];
     const dataStore = this.dataStore;
     switch (params.operation) {
-      case "add":
-        if (dataStore) {
-          const current = dataStore.data.statusIgnoredIssues ?? [];
-          dataStore.data.statusIgnoredIssues = current.concat(issues).distinct();
-          this.logger.debug(
-            "Adding ignored issues: [" +
-              current.join(",") +
-              "] -> [" +
-              dataStore.data.statusIgnoredIssues.join(",") +
-              "].",
-          );
-          await dataStore.save();
-          return true;
-        }
-        break;
-      case "remove":
-        if (dataStore) {
-          const current = dataStore.data.statusIgnoredIssues ?? [];
-          dataStore.data.statusIgnoredIssues = current.filter((item) => !issues.includes(item));
-          this.logger.debug(
-            "Removing ignored issues: [" +
-              current.join(",") +
-              "] -> [" +
-              dataStore.data.statusIgnoredIssues.join(",") +
-              "].",
-          );
+      case "add": {
+        const current = dataStore.data.statusIgnoredIssues ?? [];
+        dataStore.data.statusIgnoredIssues = current.concat(issues).distinct();
+        this.logger.debug(
+          "Adding ignored issues: [" +
+            current.join(",") +
+            "] -> [" +
+            dataStore.data.statusIgnoredIssues.join(",") +
+            "].",
+        );
+        await dataStore.save();
+        return true;
+      }
+      case "remove": {
+        const current = dataStore.data.statusIgnoredIssues ?? [];
+        dataStore.data.statusIgnoredIssues = current.filter((item) => !issues.includes(item));
+        this.logger.debug(
+          "Removing ignored issues: [" +
+            current.join(",") +
+            "] -> [" +
+            dataStore.data.statusIgnoredIssues.join(",") +
+            "].",
+        );
 
-          await dataStore.save();
-          return true;
-        }
-        break;
-      case "removeAll":
-        if (dataStore) {
-          dataStore.data.statusIgnoredIssues = [];
-          this.logger.debug("Removing all ignored issues.");
-          await dataStore.save();
-          return true;
-        }
-        break;
+        await dataStore.save();
+        return true;
+      }
+      case "removeAll": {
+        dataStore.data.statusIgnoredIssues = [];
+        this.logger.debug("Removing all ignored issues.");
+        await dataStore.save();
+        return true;
+      }
       default:
         break;
     }
     return false;
   }
 
-  private buildStatusInfo(): StatusInfo {
+  private buildStatusInfo(options: { includeHelpMessage?: boolean } = {}): StatusInfo {
     let statusInfo: StatusInfo;
     const apiClientStatus = this.tabbyApiClient.getStatus();
     switch (apiClientStatus) {
@@ -205,7 +206,12 @@ export class StatusProvider extends EventEmitter implements Feature {
       case "ready":
         {
           const ignored = this.dataStore.data.statusIgnoredIssues ?? [];
-          if (this.tabbyApiClient.hasCompletionResponseTimeIssue() && !ignored.includes("completionResponseSlow")) {
+          if (this.tabbyApiClient.isRateLimitExceeded()) {
+            statusInfo = { status: "rateLimitExceeded" };
+          } else if (
+            this.tabbyApiClient.hasCompletionResponseTimeIssue() &&
+            !ignored.includes("completionResponseSlow")
+          ) {
             statusInfo = { status: "completionResponseSlow" };
           } else if (this.tabbyApiClient.isFetchingCompletion()) {
             statusInfo = { status: "fetching" };
@@ -227,13 +233,16 @@ export class StatusProvider extends EventEmitter implements Feature {
     }
     this.fillToolTip(statusInfo);
     statusInfo.serverHealth = this.tabbyApiClient.getServerHealth();
-    statusInfo.command = this.tabbyApiClient.hasHelpMessage()
+    const hasHelpMessage = this.tabbyApiClient.hasHelpMessage();
+    statusInfo.command = hasHelpMessage
       ? {
           title: "Detail",
           command: "tabby/status/showHelpMessage",
           arguments: [{}],
         }
       : undefined;
+    statusInfo.helpMessage =
+      hasHelpMessage && options.includeHelpMessage ? this.tabbyApiClient.getHelpMessage() : undefined;
     return statusInfo;
   }
 
@@ -262,6 +271,9 @@ export class StatusProvider extends EventEmitter implements Feature {
         break;
       case "completionResponseSlow":
         statusInfo.tooltip = "Tabby: Slow Completion Response Detected";
+        break;
+      case "rateLimitExceeded":
+        statusInfo.tooltip = "Tabby: Too Many Requests";
         break;
       default:
         break;

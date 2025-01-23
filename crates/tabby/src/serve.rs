@@ -10,6 +10,7 @@ use tabby_common::{
     config::{Config, ModelConfig},
     usage,
 };
+use tabby_download::ModelKind;
 use tabby_inference::ChatCompletionStream;
 use tokio::{sync::oneshot::Sender, time::sleep};
 use tower_http::timeout::TimeoutLayer;
@@ -54,12 +55,6 @@ Install following IDE / Editor extensions to get started with [Tabby](https://gi
     ),
     paths(routes::log_event, routes::completions, routes::chat_completions_utoipa, routes::health, routes::setting),
     components(schemas(
-        api::code::CodeSearchHit,
-        api::code::CodeSearchQuery,
-        api::code::CodeSearchScores,
-        api::code::CodeSearchDocument,
-        api::doc::DocSearchHit,
-        api::doc::DocSearchDocument,
         api::event::LogEventRequest,
         completion::CompletionRequest,
         completion::CompletionResponse,
@@ -108,11 +103,6 @@ pub struct ServeArgs {
 
     #[cfg(feature = "ee")]
     #[clap(hide = true, long, default_value_t = false)]
-    #[deprecated(since = "0.11.0", note = "webserver is enabled by default")]
-    webserver: bool,
-
-    #[cfg(feature = "ee")]
-    #[clap(hide = true, long, default_value_t = false)]
     no_webserver: bool,
 }
 
@@ -122,12 +112,6 @@ pub async fn main(config: &Config, args: &ServeArgs) {
     load_model(&config).await;
 
     let tx = try_run_spinner();
-
-    #[cfg(feature = "ee")]
-    #[allow(deprecated)]
-    if args.webserver {
-        warn!("'--webserver' is enabled by default since 0.11, and will be removed in the next major release. Please remove this flag from your command.");
-    }
 
     #[allow(unused_assignments)]
     let mut webserver = None;
@@ -156,7 +140,7 @@ pub async fn main(config: &Config, args: &ServeArgs) {
     }
 
     let index_reader_provider = Arc::new(IndexReaderProvider::default());
-    let docsearch = Arc::new(services::doc::create(
+    let docsearch = Arc::new(services::structured_doc::create(
         embedding.clone(),
         index_reader_provider.clone(),
     ));
@@ -167,7 +151,7 @@ pub async fn main(config: &Config, args: &ServeArgs) {
     ));
 
     let model = &config.model;
-    let (completion, chat) = create_completion_service_and_chat(
+    let (completion, completion_stream, chat) = create_completion_service_and_chat(
         &config.completion,
         code.clone(),
         logger.clone(),
@@ -193,9 +177,16 @@ pub async fn main(config: &Config, args: &ServeArgs) {
     #[cfg(feature = "ee")]
     if let Some(ws) = &ws {
         let (new_api, new_ui) = ws
-            .attach(&config, api, ui, code, chat, docsearch, |x| {
-                Box::new(services::doc::create_serper(x))
-            })
+            .attach(
+                &config,
+                api,
+                ui,
+                code,
+                chat,
+                completion_stream,
+                docsearch,
+                |x| Box::new(services::structured_doc::create_serper(x)),
+            )
             .await;
         api = new_api;
         ui = new_ui;
@@ -211,15 +202,15 @@ pub async fn main(config: &Config, args: &ServeArgs) {
 
 async fn load_model(config: &Config) {
     if let Some(ModelConfig::Local(ref model)) = config.model.completion {
-        download_model_if_needed(&model.model_id).await;
+        download_model_if_needed(&model.model_id, ModelKind::Completion).await;
     }
 
     if let Some(ModelConfig::Local(ref model)) = config.model.chat {
-        download_model_if_needed(&model.model_id).await;
+        download_model_if_needed(&model.model_id, ModelKind::Chat).await;
     }
 
     if let ModelConfig::Local(ref model) = config.model.embedding {
-        download_model_if_needed(&model.model_id).await;
+        download_model_if_needed(&model.model_id, ModelKind::Embedding).await;
     }
 }
 

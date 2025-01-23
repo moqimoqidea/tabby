@@ -1,23 +1,19 @@
 import React from 'react'
-import { GraphQLError } from 'graphql'
-import { CombinedError } from 'urql'
 
 import { graphql } from '@/lib/gql/generates'
 
 import {
   CreateMessageInput,
-  MessageCodeSearchHit,
-  MessageDocSearchHit,
-  ThreadRunItem,
+  CreateThreadRunSubscription as CreateThreadRunSubscriptionResponse,
   ThreadRunOptionsInput
 } from '../gql/generates/graphql'
 import { client, useMutation } from '../tabby/gql'
+import {
+  ExtendedCombinedError,
+  ThreadAssistantMessageAttachmentCodeHits,
+  ThreadAssistantMessageAttachmentDocHits
+} from '../types'
 import { useLatest } from './use-latest'
-
-export interface ExtendedCombinedError
-  extends Omit<CombinedError, 'graphQLErrors'> {
-  graphQLErrors?: GraphQLError[]
-}
 
 interface UseThreadRunOptions {
   onError?: (err: Error) => void
@@ -42,9 +38,11 @@ const CreateThreadAndRunSubscription = graphql(/* GraphQL */ `
         questions
       }
       ... on ThreadAssistantMessageAttachmentsCode {
+        codeSourceId
         hits {
           code {
             gitUrl
+            commit
             filepath
             language
             content
@@ -60,9 +58,34 @@ const CreateThreadAndRunSubscription = graphql(/* GraphQL */ `
       ... on ThreadAssistantMessageAttachmentsDoc {
         hits {
           doc {
-            title
-            link
-            content
+            __typename
+            ... on MessageAttachmentWebDoc {
+              title
+              link
+              content
+            }
+            ... on MessageAttachmentIssueDoc {
+              title
+              link
+              author {
+                id
+                email
+                name
+              }
+              body
+              closed
+            }
+            ... on MessageAttachmentPullDoc {
+              title
+              link
+              author {
+                id
+                email
+                name
+              }
+              body
+              merged
+            }
           }
           score
         }
@@ -94,9 +117,11 @@ const CreateThreadRunSubscription = graphql(/* GraphQL */ `
         questions
       }
       ... on ThreadAssistantMessageAttachmentsCode {
+        codeSourceId
         hits {
           code {
             gitUrl
+            commit
             filepath
             language
             content
@@ -112,9 +137,34 @@ const CreateThreadRunSubscription = graphql(/* GraphQL */ `
       ... on ThreadAssistantMessageAttachmentsDoc {
         hits {
           doc {
-            title
-            link
-            content
+            __typename
+            ... on MessageAttachmentWebDoc {
+              title
+              link
+              content
+            }
+            ... on MessageAttachmentIssueDoc {
+              title
+              link
+              author {
+                id
+                email
+                name
+              }
+              body
+              closed
+            }
+            ... on MessageAttachmentPullDoc {
+              title
+              link
+              author {
+                id
+                email
+                name
+              }
+              body
+              merged
+            }
           }
           score
         }
@@ -142,16 +192,14 @@ const DeleteThreadMessagePairMutation = graphql(/* GraphQL */ `
     )
   }
 `)
-
-type ID = string
-
 export interface AnswerStream {
-  threadId?: ID
-  userMessageId?: ID
-  assistantMessageId?: ID
+  threadId?: string
+  userMessageId?: string
+  assistantMessageId?: string
+  codeSourceId?: string
   relevantQuestions?: Array<string>
-  attachmentsCode?: Array<MessageCodeSearchHit>
-  attachmentsDoc?: Array<MessageDocSearchHit>
+  attachmentsCode?: ThreadAssistantMessageAttachmentCodeHits
+  attachmentsDoc?: ThreadAssistantMessageAttachmentDocHits
   content: string
   completed: boolean
 }
@@ -207,7 +255,7 @@ export function useThreadRun({
   const [error, setError] = React.useState<ExtendedCombinedError | undefined>()
   const combineAnswerStream = (
     existingData: AnswerStream,
-    data: ThreadRunItem
+    data: CreateThreadRunSubscriptionResponse['createThreadRun']
   ): AnswerStream => {
     const x: AnswerStream = {
       ...existingData
@@ -228,6 +276,7 @@ export function useThreadRun({
         break
       case 'ThreadAssistantMessageAttachmentsCode':
         x.attachmentsCode = data.hits
+        x.codeSourceId = data.codeSourceId
         break
       case 'ThreadAssistantMessageAttachmentsDoc':
         x.attachmentsDoc = data.hits

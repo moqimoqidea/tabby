@@ -23,6 +23,8 @@ pub struct ThreadMessageDAO {
     pub role: String,
     pub content: String,
 
+    pub code_source_id: Option<String>,
+
     pub code_attachments: Option<Json<Vec<ThreadMessageAttachmentCode>>>,
     pub client_code_attachments: Option<Json<Vec<ThreadMessageAttachmentClientCode>>>,
     pub doc_attachments: Option<Json<Vec<ThreadMessageAttachmentDoc>>>,
@@ -32,19 +34,56 @@ pub struct ThreadMessageDAO {
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct ThreadMessageAttachmentDoc {
+#[serde(untagged)] // Mark the serde serialization format as untagged for backward compatibility: https://serde.rs/enum-representations.html#untagged
+pub enum ThreadMessageAttachmentDoc {
+    Web(ThreadMessageAttachmentWebDoc),
+    Issue(ThreadMessageAttachmentIssueDoc),
+    Pull(ThreadMessageAttachmentPullDoc),
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ThreadMessageAttachmentWebDoc {
     pub title: String,
     pub link: String,
     pub content: String,
 }
 
 #[derive(Serialize, Deserialize)]
+pub struct ThreadMessageAttachmentIssueDoc {
+    pub title: String,
+    pub link: String,
+    pub author_user_id: Option<String>,
+    pub body: String,
+    pub closed: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ThreadMessageAttachmentPullDoc {
+    pub title: String,
+    pub link: String,
+    pub author_user_id: Option<String>,
+    pub body: String,
+    pub diff: String,
+    pub merged: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ThreadMessageAttachmentAuthor {
+    pub id: String,
+    pub name: String,
+    pub email: String,
+}
+
+#[derive(Serialize, Deserialize)]
 pub struct ThreadMessageAttachmentCode {
     pub git_url: String,
+    pub commit: Option<String>,
     pub language: String,
     pub filepath: String,
     pub content: String,
-    pub start_line: usize,
+
+    /// When start line is `None`, it represents the entire file.
+    pub start_line: Option<usize>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -189,12 +228,14 @@ impl DbConn {
     pub async fn update_thread_message_code_attachments(
         &self,
         message_id: i64,
+        code_source_id: &str,
         code_attachments: &[ThreadMessageAttachmentCode],
     ) -> Result<()> {
         let code_attachments = Json(code_attachments);
         query!(
-            "UPDATE thread_messages SET code_attachments = ?, updated_at = DATETIME('now') WHERE id = ?",
+            "UPDATE thread_messages SET code_attachments = ?, code_source_id = ?, updated_at = DATETIME('now') WHERE id = ?",
             code_attachments,
+            code_source_id,
             message_id
         )
         .execute(&self.pool)
@@ -212,6 +253,24 @@ impl DbConn {
         query!(
             "UPDATE thread_messages SET doc_attachments = ?, updated_at = DATETIME('now') WHERE id = ?",
             doc_attachments,
+            message_id
+        )
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    pub async fn update_thread_message_content(
+        &self,
+        thread_id: i64,
+        message_id: i64,
+        content: &str,
+    ) -> Result<()> {
+        query!(
+            "UPDATE thread_messages SET content = ?, updated_at = DATETIME('now') WHERE thread_id = ? AND id = ?",
+            content,
+            thread_id,
             message_id
         )
         .execute(&self.pool)
@@ -244,6 +303,7 @@ impl DbConn {
                 thread_id,
                 role,
                 content,
+                code_source_id,
                 code_attachments as "code_attachments: Json<Vec<ThreadMessageAttachmentCode>>",
                 client_code_attachments as "client_code_attachments: Json<Vec<ThreadMessageAttachmentClientCode>>",
                 doc_attachments as "doc_attachments: Json<Vec<ThreadMessageAttachmentDoc>>",
@@ -277,6 +337,7 @@ impl DbConn {
                 "thread_id",
                 "role",
                 "content",
+                "code_source_id",
                 "code_attachments" as "code_attachments: Json<Vec<ThreadMessageAttachmentCode>>",
                 "client_code_attachments" as "client_code_attachments: Json<Vec<ThreadMessageAttachmentClientCode>>",
                 "doc_attachments" as "doc_attachments: Json<Vec<ThreadMessageAttachmentDoc>>",
@@ -335,6 +396,14 @@ impl DbConn {
         )
         .execute(&self.pool)
         .await?;
+
+        Ok(())
+    }
+
+    pub async fn delete_thread(&self, id: i64) -> Result<()> {
+        query!("DELETE FROM threads WHERE id = ?", id,)
+            .execute(&self.pool)
+            .await?;
 
         Ok(())
     }

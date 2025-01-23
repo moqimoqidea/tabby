@@ -13,6 +13,7 @@ import {
   ClientCapabilities,
   ServerCapabilities,
   ClientProvidedConfig,
+  DataStoreRecords,
   AgentServerInfoRequest,
   AgentServerInfoSync,
   ServerInfo,
@@ -47,6 +48,7 @@ import { StatusProvider } from "./status";
 import { CommandProvider } from "./command";
 import { name as serverName, version as serverVersion } from "../package.json";
 import "./utils/array";
+import { SmartApplyFeature } from "./chat/smartApply";
 import { FileTracker } from "./codeSearch/fileTracker";
 
 export class Server {
@@ -87,6 +89,7 @@ export class Server {
     this.tabbyApiClient,
     this.gitContextProvider,
   );
+  private readonly smartApplyFeature = new SmartApplyFeature(this.configurations, this.tabbyApiClient, this.documents);
 
   private readonly statusProvider = new StatusProvider(this.dataStore, this.configurations, this.tabbyApiClient);
   private readonly commandProvider = new CommandProvider(this.chatEditProvider, this.statusProvider);
@@ -152,6 +155,7 @@ export class Server {
     this.clientCapabilities = clientCapabilities;
 
     const clientProvidedConfig: ClientProvidedConfig = params.initializationOptions?.config ?? {};
+    const dataStoreRecords: DataStoreRecords | undefined = params.initializationOptions?.dataStoreRecords;
 
     const baseCapabilities: ServerCapabilities = {
       textDocumentSync: {
@@ -174,7 +178,7 @@ export class Server {
     };
 
     this.logger.debug("Initializing internal components...");
-    await this.dataStore.initialize(this.connection, clientCapabilities);
+    await this.dataStore.initialize(this.connection, clientCapabilities, clientProvidedConfig, dataStoreRecords);
     await this.configurations.initialize(this.connection, clientCapabilities, clientProvidedConfig);
     await this.anonymousUsageLogger.initialize(clientInfo);
     await this.tabbyApiClient.initialize(clientInfo);
@@ -189,11 +193,12 @@ export class Server {
       this.chatFeature,
       this.chatEditProvider,
       this.commitMessageGenerator,
+      this.smartApplyFeature,
       this.statusProvider,
       this.commandProvider,
       this.fileTracker,
     ].mapAsync((feature: Feature) => {
-      return feature.initialize(this.connection, clientCapabilities, clientProvidedConfig);
+      return feature.initialize(this.connection, clientCapabilities, clientProvidedConfig, dataStoreRecords);
     });
     this.logger.debug("Feature components initialized.");
 
@@ -214,11 +219,15 @@ export class Server {
 
   private async initialized(): Promise<void> {
     this.logger.info("Received initialized notification.");
-    await [this.configurations, this.statusProvider, this.completionProvider, this.chatFeature].mapAsync(
-      (feature: Feature) => {
-        return feature.initialized?.(this.connection);
-      },
-    );
+    await [
+      this.dataStore,
+      this.configurations,
+      this.statusProvider,
+      this.completionProvider,
+      this.chatFeature,
+    ].mapAsync((feature: Feature) => {
+      return feature.initialized?.(this.connection);
+    });
 
     // FIXME(@icycodes): remove deprecated methods
     if (this.clientCapabilities?.tabby?.agent) {

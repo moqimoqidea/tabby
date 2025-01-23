@@ -25,6 +25,7 @@ pub struct CreateThreadAndRunInput {
     #[validate(nested)]
     pub thread: CreateThreadInput,
 
+    #[validate(nested)]
     #[graphql(default)]
     pub options: ThreadRunOptionsInput,
 }
@@ -70,6 +71,9 @@ fn validate_code_query_input(input: &CodeQueryInput) -> Result<(), ValidationErr
 
 #[derive(GraphQLInputObject, Validate, Default, Clone)]
 pub struct ThreadRunOptionsInput {
+    #[graphql(default)]
+    pub model_name: Option<String>,
+
     #[validate(nested)]
     #[graphql(default)]
     pub doc_query: Option<DocQueryInput>,
@@ -139,7 +143,10 @@ pub struct MessageAttachmentInput {
 #[derive(GraphQLInputObject, Clone)]
 pub struct MessageAttachmentCodeInput {
     pub filepath: Option<String>,
+
+    /// When start line is `None`, it represents the entire file.
     pub start_line: Option<i32>,
+
     pub content: String,
 }
 

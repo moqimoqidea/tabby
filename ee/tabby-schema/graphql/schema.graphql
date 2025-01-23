@@ -10,6 +10,13 @@ enum AuthMethod {
   LOGIN
 }
 
+enum AuthProviderKind {
+  OAUTH_GITHUB
+  OAUTH_GOOGLE
+  OAUTH_GITLAB
+  LDAP
+}
+
 "Represents the kind of context source."
 enum ContextSourceKind {
   GIT
@@ -61,6 +68,12 @@ enum Language {
   OTHER
 }
 
+enum LdapEncryptionKind {
+  NONE
+  START_TLS
+  LDAPS
+}
+
 enum LicenseStatus {
   OK
   EXPIRED
@@ -71,6 +84,12 @@ enum LicenseType {
   COMMUNITY
   TEAM
   ENTERPRISE
+}
+
+enum ModelHealthBackend {
+  CHAT
+  COMPLETION
+  EMBEDDING
 }
 
 enum OAuthProvider {
@@ -128,7 +147,7 @@ input CreateMessageInput {
 
 input CreateThreadAndRunInput {
   thread: CreateThreadInput!
-  options: ThreadRunOptionsInput! = {codeQuery: null, debugOptions: null, docQuery: null, generateRelevantQuestions: false}
+  options: ThreadRunOptionsInput! = {codeQuery: null, debugOptions: null, docQuery: null, generateRelevantQuestions: false, modelName: null}
 }
 
 input CreateThreadInput {
@@ -138,7 +157,7 @@ input CreateThreadInput {
 input CreateThreadRunInput {
   threadId: ID!
   additionalUserMessage: CreateMessageInput!
-  options: ThreadRunOptionsInput! = {codeQuery: null, debugOptions: null, docQuery: null, generateRelevantQuestions: false}
+  options: ThreadRunOptionsInput! = {codeQuery: null, debugOptions: null, docQuery: null, generateRelevantQuestions: false, modelName: null}
 }
 
 input CreateUserGroupInput {
@@ -163,7 +182,7 @@ input EmailSettingInput {
 
 input MessageAttachmentCodeInput {
   filepath: String
-  startLine: Int
+  "When start line is `None`, it represents the entire file." startLine: Int
   content: String!
 }
 
@@ -210,6 +229,7 @@ input ThreadRunDebugOptionsInput {
 }
 
 input ThreadRunOptionsInput {
+  modelName: String = null
   docQuery: DocQueryInput = null
   codeQuery: CodeQueryInput = null
   generateRelevantQuestions: Boolean! = false
@@ -222,6 +242,25 @@ input UpdateIntegrationInput {
   accessToken: String
   apiBase: String
   kind: IntegrationKind!
+}
+
+input UpdateLdapCredentialInput {
+  host: String!
+  port: Int!
+  bindDn: String!
+  bindPassword: String
+  baseDn: String!
+  userFilter: String!
+  encryption: LdapEncryptionKind!
+  skipTlsVerify: Boolean!
+  emailAttribute: String!
+  nameAttribute: String
+}
+
+input UpdateMessageInput {
+  id: ID!
+  threadId: ID!
+  content: String!
 }
 
 input UpdateOAuthCredentialInput {
@@ -257,6 +296,7 @@ interface User {
   isAdmin: Boolean!
   isOwner: Boolean!
   active: Boolean!
+  isSsoUser: Boolean!
 }
 
 """
@@ -274,6 +314,10 @@ interface User {
   [2]: https://docs.rs/chrono/latest/chrono/struct.DateTime.html
 """
 scalar DateTime
+
+type AuthProvider {
+  kind: AuthProviderKind!
+}
 
 type CompletionStats {
   start: DateTime!
@@ -451,6 +495,20 @@ type JobStats {
   pending: Int!
 }
 
+type LdapCredential {
+  host: String!
+  port: Int!
+  bindDn: String!
+  baseDn: String!
+  userFilter: String!
+  encryption: LdapEncryptionKind!
+  skipTlsVerify: Boolean!
+  emailAttribute: String!
+  nameAttribute: String
+  createdAt: DateTime!
+  updatedAt: DateTime!
+}
+
 type LicenseInfo {
   type: LicenseType!
   status: LicenseStatus!
@@ -463,6 +521,7 @@ type LicenseInfo {
 type Message {
   id: ID!
   threadId: ID!
+  codeSourceId: String
   role: Role!
   content: String!
   attachment: MessageAttachment!
@@ -484,10 +543,12 @@ type MessageAttachmentClientCode {
 
 type MessageAttachmentCode {
   gitUrl: String!
+  commit: String
   filepath: String!
   language: String!
   content: String!
-  startLine: Int!
+  "When start line is `None`, it represents the entire file."
+  startLine: Int
 }
 
 type MessageAttachmentCodeScores {
@@ -496,7 +557,24 @@ type MessageAttachmentCodeScores {
   embedding: Float!
 }
 
-type MessageAttachmentDoc {
+type MessageAttachmentIssueDoc {
+  title: String!
+  link: String!
+  author: User
+  body: String!
+  closed: Boolean!
+}
+
+type MessageAttachmentPullDoc {
+  title: String!
+  link: String!
+  author: User
+  body: String!
+  patch: String!
+  merged: Boolean!
+}
+
+type MessageAttachmentWebDoc {
   title: String!
   link: String!
   content: String!
@@ -522,6 +600,11 @@ type MessageEdge {
   cursor: String!
 }
 
+type ModelBackendHealthInfo {
+  "Latency in milliseconds."
+  latencyMs: Int!
+}
+
 type Mutation {
   resetRegistrationToken: String!
   requestInvitationEmail(input: RequestInvitationInput!): Invitation!
@@ -537,16 +620,21 @@ type Mutation {
   updateUserName(id: ID!, name: String!): Boolean!
   register(email: String!, password1: String!, password2: String!, invitationCode: String, name: String!): RegisterResponse!
   tokenAuth(email: String!, password: String!): TokenAuthResponse!
+  tokenAuthLdap(userId: String!, password: String!): TokenAuthResponse!
   verifyToken(token: String!): Boolean!
   refreshToken(refreshToken: String!): RefreshTokenResponse!
   createInvitation(email: String!): ID!
   sendTestEmail(to: String!): Boolean!
+  markNotificationsRead(notificationId: ID): Boolean!
   createGitRepository(name: String!, gitUrl: String!): ID!
   deleteGitRepository(id: ID!): Boolean!
   updateGitRepository(id: ID!, name: String!, gitUrl: String!): Boolean!
   deleteInvitation(id: ID!): ID!
   updateOauthCredential(input: UpdateOAuthCredentialInput!): Boolean!
   deleteOauthCredential(provider: OAuthProvider!): Boolean!
+  testLdapConnection(input: UpdateLdapCredentialInput!): Boolean!
+  updateLdapCredential(input: UpdateLdapCredentialInput!): Boolean!
+  deleteLdapCredential: Boolean!
   updateEmailSetting(input: EmailSettingInput!): Boolean!
   updateSecuritySetting(input: SecuritySettingInput!): Boolean!
   updateNetworkSetting(input: NetworkSettingInput!): Boolean!
@@ -561,8 +649,10 @@ type Mutation {
   triggerJobRun(command: String!): ID!
   "Delete pair of user message and bot response in a thread."
   deleteThreadMessagePair(threadId: ID!, userMessageId: ID!, assistantMessageId: ID!): Boolean!
+  deleteThread(id: ID!): Boolean!
   "Turn on persisted status for a thread."
   setThreadPersisted(threadId: ID!): Boolean!
+  updateThreadMessage(input: UpdateMessageInput!): Boolean!
   createCustomDocument(input: CreateCustomDocumentInput!): ID!
   deleteCustomDocument(id: ID!): Boolean!
   setPresetDocumentActive(input: SetPresetDocumentActiveInput!): Boolean!
@@ -576,6 +666,14 @@ type Mutation {
 
 type NetworkSetting {
   externalUrl: String!
+}
+
+type Notification {
+  id: ID!
+  content: String!
+  read: Boolean!
+  createdAt: DateTime!
+  updatedAt: DateTime!
 }
 
 type OAuthCredential {
@@ -668,14 +766,17 @@ type Query {
     * `func_name lang:go`
   """
   repositoryGrep(kind: RepositoryKind!, id: ID!, rev: String, query: String!): RepositoryGrepOutput!
+  authProviders: [AuthProvider!]!
   oauthCredential(provider: OAuthProvider!): OAuthCredential
   oauthCallbackUrl(provider: OAuthProvider!): String!
+  ldapCredential: LdapCredential
   serverInfo: ServerInfo!
   license: LicenseInfo!
   jobs: [String!]!
   dailyStatsInPastYear(users: [ID!]): [CompletionStats!]!
   dailyStats(start: DateTime!, end: DateTime!, users: [ID!], languages: [Language!]): [CompletionStats!]!
   userEvents(after: String, before: String, first: Int, last: Int, users: [ID!], start: DateTime!, end: DateTime!): UserEventConnection!
+  notifications: [Notification!]!
   diskUsageStats: DiskUsageStats!
   repositoryList: [Repository!]!
   contextInfo: ContextInfo!
@@ -693,6 +794,7 @@ type Query {
   "List user groups."
   userGroups: [UserGroup!]!
   sourceIdAccessPolicies(sourceId: String!): SourceIdAccessPolicy!
+  testModelConnection(backend: ModelHealthBackend!): ModelBackendHealthInfo!
 }
 
 type RefreshTokenResponse {
@@ -764,6 +866,7 @@ type Thread {
 }
 
 type ThreadAssistantMessageAttachmentsCode {
+  codeSourceId: String!
   hits: [MessageCodeSearchHit!]!
 }
 
@@ -863,6 +966,7 @@ type UserSecured implements User {
   active: Boolean!
   authToken: String!
   isPasswordSet: Boolean!
+  isSsoUser: Boolean!
 }
 
 type WebContextSource implements ContextSourceId & ContextSource {
@@ -871,6 +975,8 @@ type WebContextSource implements ContextSourceId & ContextSource {
   sourceId: String!
   sourceName: String!
 }
+
+union MessageAttachmentDoc = MessageAttachmentWebDoc | MessageAttachmentIssueDoc | MessageAttachmentPullDoc
 
 """
   Schema of thread run stream.

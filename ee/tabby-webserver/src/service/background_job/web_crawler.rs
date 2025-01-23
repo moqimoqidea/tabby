@@ -4,14 +4,17 @@ use chrono::Utc;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use tabby_crawler::crawl_pipeline;
-use tabby_index::public::{DocIndexer, WebDocument};
+use tabby_index::public::{
+    StructuredDoc, StructuredDocFields, StructuredDocIndexer, StructuredDocState,
+    StructuredDocWebFields,
+};
 use tabby_inference::Embedding;
 
 use super::helper::Job;
 
 const CRAWLER_TIMEOUT_SECS: u64 = 7200;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct WebCrawlerJob {
     source_id: String,
     url: String,
@@ -35,22 +38,33 @@ impl WebCrawlerJob {
         logkit::info!("Starting doc index pipeline for {}", self.url);
         let embedding = embedding.clone();
         let mut num_docs = 0;
-        let indexer = DocIndexer::new(embedding.clone());
+        let indexer = StructuredDocIndexer::new(embedding.clone());
 
         let url_prefix = self.url_prefix.as_ref().unwrap_or(&self.url);
         let mut pipeline = Box::pin(crawl_pipeline(&self.url, url_prefix).await?);
         while let Some(doc) = pipeline.next().await {
             logkit::info!("Fetching {}", doc.url);
-            let source_doc = WebDocument {
+            let source_doc = StructuredDoc {
                 source_id: self.source_id.clone(),
-                id: doc.url.clone(),
-                title: doc.metadata.title.unwrap_or_default(),
-                link: doc.url,
-                body: doc.markdown,
+                fields: StructuredDocFields::Web(StructuredDocWebFields {
+                    title: doc.metadata.title.unwrap_or_default(),
+                    link: doc.url,
+                    body: doc.markdown,
+                }),
             };
 
             num_docs += 1;
-            indexer.add(Utc::now(), source_doc).await;
+
+            if indexer
+                .presync(&StructuredDocState {
+                    id: source_doc.id().to_string(),
+                    updated_at: Utc::now(),
+                    deleted: false,
+                })
+                .await
+            {
+                indexer.sync(source_doc).await;
+            }
         }
         logkit::info!("Crawled {} documents from '{}'", num_docs, self.url);
         indexer.commit();
