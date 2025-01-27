@@ -23,6 +23,13 @@ export type CompletionRequest = {
   declarations?: Declaration[];
   relevantSnippetsFromChangedFiles?: CodeSnippet[];
   relevantSnippetsFromOpenedFiles?: CodeSnippet[];
+  //auto complete part
+  autoComplete?: {
+    completionItem?: string;
+    insertPosition?: number;
+    insertSeg?: string;
+    currSeg?: string;
+  };
 };
 
 export type Declaration = {
@@ -76,41 +83,61 @@ export class CompletionContext {
   mode: "default" | "fill-in-line";
   hash: string;
 
+  // example of auto complete part
+  // cons| -> console
+  // completionItem: console
+  // insertPosition: 4
+  // insertSeg: ole
+  // currSeg: cons
+  completionItem: string = "";
+  insertPosition: number = 0;
+  insertSeg: string = "";
+  currSeg: string = "";
+  withCorrectCompletionItem: boolean = false; // weather we are using completionItem or not
+
+  // is current suffix is at end of line excluding auto closed char
+  lineEnd: RegExpMatchArray | null = null;
+
   constructor(request: CompletionRequest) {
     this.filepath = request.filepath;
     this.language = request.language;
-    this.text = request.text;
-    this.position = request.position;
     this.indentation = request.indentation;
+    this.position = request.position;
+    this.text = request.text;
+    this.prefix = this.text.slice(0, this.position);
+    this.suffix = this.text.slice(this.position);
 
-    this.prefix = request.text.slice(0, request.position);
-    this.suffix = request.text.slice(request.position);
+    if (request.autoComplete?.completionItem) {
+      this.handleAutoComplete(request);
+    }
+
     this.prefixLines = splitLines(this.prefix);
     this.suffixLines = splitLines(this.suffix);
     this.currentLinePrefix = this.prefixLines[this.prefixLines.length - 1] ?? "";
     this.currentLineSuffix = this.suffixLines[0] ?? "";
-
     this.clipboard = request.clipboard?.trim() ?? "";
-
     this.workspace = request.workspace;
     this.git = request.git;
-
     this.declarations = request.declarations;
     this.relevantSnippetsFromChangedFiles = request.relevantSnippetsFromChangedFiles;
     this.snippetsFromOpenedFiles = request.relevantSnippetsFromOpenedFiles;
 
-    const lineEnd = isAtLineEndExcludingAutoClosedChar(this.currentLineSuffix);
-    this.mode = lineEnd ? "default" : "fill-in-line";
+    this.lineEnd = isAtLineEndExcludingAutoClosedChar(this.currentLineSuffix);
+    this.mode = this.lineEnd ? "default" : "fill-in-line";
     this.hash = hashObject({
       filepath: this.filepath,
       language: this.language,
       prefix: this.prefix,
-      currentLineSuffix: lineEnd ? "" : this.currentLineSuffix,
+      currentLineSuffix: this.lineEnd ? "" : this.currentLineSuffix,
       nextLines: this.suffixLines.slice(1).join(""),
       position: this.position,
       clipboard: this.clipboard,
       declarations: this.declarations,
       relevantSnippetsFromChangedFiles: this.relevantSnippetsFromChangedFiles,
+      completionItem: this.completionItem,
+      insertPosition: this.insertPosition,
+      insertSeg: this.insertSeg,
+      currSeg: this.currSeg,
     });
   }
 
@@ -121,6 +148,7 @@ export class CompletionContext {
 
   // Generate a CompletionContext based on this CompletionContext.
   // Simulate as if the user input new text based on this CompletionContext.
+  // FIXME: generate the context according to `selectedCompletionInfo`
   forward(delta: string) {
     return new CompletionContext({
       filepath: this.filepath,
@@ -132,14 +160,63 @@ export class CompletionContext {
       git: this.git,
       declarations: this.declarations,
       relevantSnippetsFromChangedFiles: this.relevantSnippetsFromChangedFiles,
+      relevantSnippetsFromOpenedFiles: this.snippetsFromOpenedFiles,
+      autoComplete: {
+        completionItem: this.completionItem,
+        insertPosition: this.insertPosition,
+        insertSeg: this.insertSeg,
+        currSeg: this.currSeg,
+      },
     });
+  }
+
+  /**
+   * The method handles the auto complete part of the completion request.
+   * @param request completion request
+   * @returns void
+   */
+  private handleAutoComplete(request: CompletionRequest): void {
+    if (!request.autoComplete?.completionItem) return;
+    // check if the completion item is the same as the curr segment
+    if (!request.autoComplete.currSeg || !request.autoComplete.completionItem.startsWith(request.autoComplete.currSeg))
+      return;
+
+    this.completionItem = request.autoComplete.completionItem;
+    this.currSeg = request.autoComplete.currSeg ?? "";
+    this.insertSeg = request.autoComplete.insertSeg ?? "";
+
+    const prefixText = request.text.slice(0, request.position);
+    const lastIndex = prefixText.lastIndexOf(this.currSeg);
+
+    if (lastIndex !== -1) {
+      this.insertPosition = lastIndex + this.currSeg.length;
+
+      this.text = request.text.slice(0, lastIndex) + this.completionItem + request.text.slice(this.insertPosition);
+
+      this.position = lastIndex + this.completionItem.length;
+
+      this.prefix = this.text.slice(0, this.position);
+      this.suffix = this.text.slice(this.position);
+      this.withCorrectCompletionItem = true;
+    }
+  }
+  isWithCorrectAutoComplete(): boolean {
+    return this.withCorrectCompletionItem;
+  }
+
+  getFullCompletionItem(): string | null {
+    return this.isWithCorrectAutoComplete() ? this.completionItem : null;
   }
 
   // Build segments for TabbyApi
   buildSegments(config: ConfigData["completion"]["prompt"]): TabbyApiComponents["schemas"]["Segments"] {
     // prefix && suffix
     const prefix = this.prefixLines.slice(Math.max(this.prefixLines.length - config.maxPrefixLines, 0)).join("");
-    const suffix = this.suffixLines.slice(0, config.maxSuffixLines).join("");
+    let suffix = this.suffixLines.slice(0, config.maxSuffixLines).join("");
+    // if it's end of line, we don't need to include the suffix
+    if (this.lineEnd) {
+      suffix = "\n" + suffix.split("\n").slice(1).join("\n");
+    }
 
     // filepath && git_url
     let relativeFilepathRoot: string | undefined = undefined;

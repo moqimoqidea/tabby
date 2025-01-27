@@ -11,12 +11,12 @@ import remarkGfm from 'remark-gfm'
 import remarkMath from 'remark-math'
 import {
   TABBY_CHAT_PANEL_API_VERSION,
-  type ChatMessage,
-  type Context,
+  type ChatCommand,
+  type EditorContext,
   type ErrorMessage,
   type FetcherOptions,
-  type InitRequest,
-  type NavigateOpts
+  type FileLocation,
+  type InitRequest
 } from 'tabby-chat-panel'
 import { useServer } from 'tabby-chat-panel/react'
 
@@ -29,6 +29,7 @@ import { MemoizedReactMarkdown } from '@/components/markdown'
 import './page.css'
 
 import { saveFetcherOptions } from '@/lib/tabby/token-management'
+import { PromptFormRef } from '@/components/chat/form-editor/types'
 
 const convertToHSLColor = (style: string) => {
   return Color(style)
@@ -46,46 +47,70 @@ const convertToHSLColor = (style: string) => {
 }
 
 export default function ChatPage() {
-  const [isInit, setIsInit] = useState(false)
+  const [isChatComponentLoaded, setIsChatComponentLoaded] = useState(false)
+  const [isServerLoaded, setIsServerLoaded] = useState(false)
   const [fetcherOptions, setFetcherOptions] = useState<FetcherOptions | null>(
     null
   )
   const [activeChatId, setActiveChatId] = useState('')
-  const [pendingMessages, setPendingMessages] = useState<ChatMessage[]>([])
+  const [pendingCommand, setPendingCommand] = useState<ChatCommand>()
   const [pendingRelevantContexts, setPendingRelevantContexts] = useState<
-    Context[]
+    EditorContext[]
   >([])
+  const [pendingActiveSelection, setPendingActiveSelection] =
+    useState<EditorContext | null>(null)
   const [errorMessage, setErrorMessage] = useState<ErrorMessage | null>(null)
   const [isRefreshLoading, setIsRefreshLoading] = useState(false)
 
   const chatRef = useRef<ChatRef>(null)
-  const [chatLoaded, setChatLoaded] = useState(false)
   const { width } = useWindowSize()
   const prevWidthRef = useRef(width)
-  const chatInputRef = useRef<HTMLTextAreaElement>(null)
+  const chatInputRef = useRef<PromptFormRef>(null)
 
   const searchParams = useSearchParams()
   const client = searchParams.get('client') as ClientType
   const isInEditor = !!client || undefined
   const useMacOSKeyboardEventHandler = useRef<boolean>()
 
-  const sendMessage = (message: ChatMessage) => {
+  // server feature support check
+  const [supportsOnApplyInEditorV2, setSupportsOnApplyInEditorV2] =
+    useState(false)
+  const [supportsOnLookupSymbol, setSupportsOnLookupSymbol] = useState(false)
+  const [
+    supportsReadWorkspaceGitRepoInfo,
+    setSupportsReadWorkspaceGitRepoInfo
+  ] = useState(false)
+  const [
+    supportsStoreAndFetchSessionState,
+    setSupportsStoreAndFetchSessionState
+  ] = useState(false)
+  const [supportsListFileInWorkspace, setSupportProvideFileAtInfo] =
+    useState(false)
+  const [supportsReadFileContent, setSupportsReadFileContent] = useState(false)
+
+  const executeCommand = (command: ChatCommand) => {
     if (chatRef.current) {
-      chatRef.current.sendUserChat(message)
+      chatRef.current.executeCommand(command)
     } else {
-      const newPendingMessages = [...pendingMessages]
-      newPendingMessages.push(message)
-      setPendingMessages(newPendingMessages)
+      setPendingCommand(command)
     }
   }
 
-  const addRelevantContext = (ctx: Context) => {
+  const addRelevantContext = (ctx: EditorContext) => {
     if (chatRef.current) {
       chatRef.current.addRelevantContext(ctx)
     } else {
       const newPendingRelevantContexts = [...pendingRelevantContexts]
       newPendingRelevantContexts.push(ctx)
       setPendingRelevantContexts(newPendingRelevantContexts)
+    }
+  }
+
+  const updateActiveSelection = (ctx: EditorContext | null) => {
+    if (chatRef.current) {
+      chatRef.current.updateActiveSelection(ctx)
+    } else if (ctx) {
+      setPendingActiveSelection(ctx)
     }
   }
 
@@ -99,13 +124,12 @@ export default function ChatPage() {
       }
 
       setActiveChatId(nanoid())
-      setIsInit(true)
       setFetcherOptions(request.fetcherOptions)
       useMacOSKeyboardEventHandler.current =
         request.useMacOSKeyboardEventHandler
     },
-    sendMessage: (message: ChatMessage) => {
-      return sendMessage(message)
+    executeCommand: async (command: ChatCommand) => {
+      return executeCommand(command)
     },
     showError: (errorMessage: ErrorMessage) => {
       setErrorMessage(errorMessage)
@@ -113,7 +137,7 @@ export default function ChatPage() {
     cleanError: () => {
       setErrorMessage(null)
     },
-    addRelevantContext: context => {
+    addRelevantContext: (context: EditorContext) => {
       return addRelevantContext(context)
     },
     updateTheme: (style, themeClass) => {
@@ -135,6 +159,9 @@ export default function ChatPage() {
       // Sync with edit theme
       document.documentElement.className =
         themeClass + ` client client-${client}`
+    },
+    updateActiveSelection: (context: EditorContext | null) => {
+      return updateActiveSelection(context)
     }
   })
 
@@ -216,14 +243,43 @@ export default function ChatPage() {
       server?.onLoaded({
         apiVersion: TABBY_CHAT_PANEL_API_VERSION
       })
+
+      const checkCapabilities = async () => {
+        server
+          ?.hasCapability('onApplyInEditorV2')
+          .then(setSupportsOnApplyInEditorV2)
+        server?.hasCapability('lookupSymbol').then(setSupportsOnLookupSymbol)
+        server
+          ?.hasCapability('readWorkspaceGitRepositories')
+          .then(setSupportsReadWorkspaceGitRepoInfo)
+        server
+          ?.hasCapability('listFileInWorkspace')
+          .then(setSupportProvideFileAtInfo)
+        server
+          ?.hasCapability('readFileContent')
+          .then(setSupportsReadFileContent)
+
+        Promise.all([
+          server?.hasCapability('fetchSessionState'),
+          server?.hasCapability('storeSessionState')
+        ]).then(results => {
+          setSupportsStoreAndFetchSessionState(
+            results.every(result => !!result)
+          )
+        })
+      }
+
+      checkCapabilities().then(() => {
+        setIsServerLoaded(true)
+      })
     }
   }, [server])
 
   useLayoutEffect(() => {
-    if (!chatLoaded) return
+    if (!isChatComponentLoaded) return
     if (
       width &&
-      isInit &&
+      isServerLoaded &&
       fetcherOptions &&
       !errorMessage &&
       !prevWidthRef.current
@@ -231,18 +287,52 @@ export default function ChatPage() {
       chatRef.current?.focus()
     }
     prevWidthRef.current = width
-  }, [width, chatLoaded])
+  }, [width, isChatComponentLoaded])
 
-  const onChatLoaded = () => {
-    pendingRelevantContexts.forEach(addRelevantContext)
-    pendingMessages.forEach(sendMessage)
+  const clearPendingState = () => {
     setPendingRelevantContexts([])
-    setPendingMessages([])
-    setChatLoaded(true)
+    setPendingCommand(undefined)
+    setPendingActiveSelection(null)
   }
 
-  const onNavigateToContext = (context: Context, opts?: NavigateOpts) => {
-    server?.navigate(context, opts)
+  const onChatLoaded = () => {
+    const currentChatRef = chatRef.current
+    if (!currentChatRef) return
+
+    pendingRelevantContexts.forEach(context => {
+      currentChatRef.addRelevantContext(context)
+    })
+
+    if (pendingActiveSelection) {
+      currentChatRef.updateActiveSelection(pendingActiveSelection)
+    }
+
+    if (pendingCommand) {
+      currentChatRef.executeCommand(pendingCommand)
+    }
+
+    clearPendingState()
+    setIsChatComponentLoaded(true)
+  }
+
+  const openInEditor = async (fileLocation: FileLocation) => {
+    return server?.openInEditor(fileLocation) ?? false
+  }
+
+  const openExternal = async (url: string) => {
+    return server?.openExternal(url)
+  }
+
+  const getActiveEditorSelection = async () => {
+    return server?.getActiveEditorSelection() ?? null
+  }
+
+  const fetchSessionState = async () => {
+    return server?.fetchSessionState?.() ?? null
+  }
+
+  const storeSessionState = async (state: Record<string, any>) => {
+    return server?.storeSessionState?.(state)
   }
 
   const refresh = async () => {
@@ -319,7 +409,7 @@ export default function ChatPage() {
     )
   }
 
-  if (!isInit || !fetcherOptions) {
+  if (!isServerLoaded || !fetcherOptions) {
     return (
       <StaticContent>
         <>
@@ -346,12 +436,44 @@ export default function ChatPage() {
         key={activeChatId}
         ref={chatRef}
         chatInputRef={chatInputRef}
-        onNavigateToContext={onNavigateToContext}
         onLoaded={onChatLoaded}
         maxWidth={client === 'vscode' ? '5xl' : undefined}
         onCopyContent={isInEditor && server?.onCopy}
-        onSubmitMessage={isInEditor && server?.onSubmitMessage}
-        onApplyInEditor={isInEditor && server?.onApplyInEditor}
+        onApplyInEditor={
+          isInEditor &&
+          (supportsOnApplyInEditorV2
+            ? server?.onApplyInEditorV2
+            : server?.onApplyInEditor)
+        }
+        supportsOnApplyInEditorV2={supportsOnApplyInEditorV2}
+        onLookupSymbol={
+          isInEditor &&
+          (supportsOnLookupSymbol ? server?.lookupSymbol : undefined)
+        }
+        openInEditor={openInEditor}
+        openExternal={openExternal}
+        readWorkspaceGitRepositories={
+          supportsReadWorkspaceGitRepoInfo
+            ? server?.readWorkspaceGitRepositories
+            : undefined
+        }
+        getActiveEditorSelection={getActiveEditorSelection}
+        fetchSessionState={
+          supportsStoreAndFetchSessionState ? fetchSessionState : undefined
+        }
+        storeSessionState={
+          supportsStoreAndFetchSessionState ? storeSessionState : undefined
+        }
+        listFileInWorkspace={
+          isInEditor && supportsListFileInWorkspace
+            ? server?.listFileInWorkspace
+            : undefined
+        }
+        readFileContent={
+          isInEditor && supportsReadFileContent
+            ? server?.readFileContent
+            : undefined
+        }
       />
     </ErrorBoundary>
   )

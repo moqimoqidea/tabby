@@ -1,22 +1,20 @@
-import { createContext, ReactNode, useContext, useMemo, useState } from 'react'
-import Image from 'next/image'
-import defaultFavicon from '@/assets/default-favicon.png'
-import DOMPurify from 'dompurify'
-import he from 'he'
+import { ReactNode, useContext, useMemo, useState } from 'react'
 import { compact, isNil } from 'lodash-es'
-import { marked } from 'marked'
 import remarkGfm from 'remark-gfm'
 import remarkMath from 'remark-math'
 
 import {
   ContextInfo,
   Maybe,
-  MessageAttachmentCode,
-  MessageAttachmentDoc
+  MessageAttachmentClientCode
 } from '@/lib/gql/generates/graphql'
-import { AttachmentCodeItem, AttachmentDocItem } from '@/lib/types'
-import { cn } from '@/lib/utils'
-import { CodeBlock, CodeBlockProps } from '@/components/ui/codeblock'
+import { AttachmentCodeItem, AttachmentDocItem, FileContext } from '@/lib/types'
+import {
+  cn,
+  convertFilepath,
+  encodeMentionPlaceHolder,
+  resolveFileNameForDisplay
+} from '@/lib/utils'
 import {
   HoverCard,
   HoverCardContent,
@@ -27,12 +25,24 @@ import { MemoizedReactMarkdown } from '@/components/markdown'
 import './style.css'
 
 import {
+  FileLocation,
+  Filepath,
+  LookupSymbolHint,
+  SymbolInfo
+} from 'tabby-chat-panel/index'
+
+import {
   MARKDOWN_CITATION_REGEX,
+  MARKDOWN_FILE_REGEX,
   MARKDOWN_SOURCE_REGEX
 } from '@/lib/constants/regex'
 
 import { Mention } from '../mention-tag'
+import { IconFile } from '../ui/icons'
 import { Skeleton } from '../ui/skeleton'
+import { CodeElement } from './code'
+import { DocDetailView } from './doc-detail-view'
+import { MessageMarkdownContext } from './markdown-context'
 
 type RelevantDocItem = {
   type: 'doc'
@@ -41,31 +51,29 @@ type RelevantDocItem = {
 
 type RelevantCodeItem = {
   type: 'code'
-  data: AttachmentCodeItem
+  data: AttachmentCodeItem | MessageAttachmentClientCode
   isClient?: boolean
 }
 
 type MessageAttachments = Array<RelevantDocItem | RelevantCodeItem>
-
-const normalizedText = (input: string) => {
-  const sanitizedHtml = DOMPurify.sanitize(input, {
-    ALLOWED_TAGS: [],
-    ALLOWED_ATTR: []
-  })
-  const parsed = marked.parse(sanitizedHtml) as string
-  const decoded = he.decode(parsed)
-  const plainText = decoded.replace(/<\/?[^>]+(>|$)/g, '')
-  return plainText
-}
 
 export interface MessageMarkdownProps {
   message: string
   headline?: boolean
   attachmentDocs?: Maybe<Array<AttachmentDocItem>>
   attachmentCode?: Maybe<Array<AttachmentCodeItem>>
+  attachmentClientCode?: Maybe<Array<MessageAttachmentClientCode>>
   onCopyContent?: ((value: string) => void) | undefined
-  onApplyInEditor?: ((value: string) => void) | undefined
-  onCodeCitationClick?: (code: MessageAttachmentCode) => void
+  onApplyInEditor?: (
+    content: string,
+    opts?: { languageId: string; smart: boolean }
+  ) => void
+  onLookupSymbol?: (
+    symbol: string,
+    hints?: LookupSymbolHint[] | undefined
+  ) => Promise<SymbolInfo | undefined>
+  openInEditor?: (target: FileLocation) => void
+  onCodeCitationClick?: (code: AttachmentCodeItem) => void
   onCodeCitationMouseEnter?: (index: number) => void
   onCodeCitationMouseLeave?: (index: number) => void
   contextInfo?: ContextInfo
@@ -73,27 +81,15 @@ export interface MessageMarkdownProps {
   className?: string
   // wrapLongLines for code block
   canWrapLongLines?: boolean
+  supportsOnApplyInEditorV2: boolean
+  activeSelection?: FileContext
 }
-
-type MessageMarkdownContextValue = {
-  onCopyContent?: ((value: string) => void) | undefined
-  onApplyInEditor?: ((value: string) => void) | undefined
-  onCodeCitationClick?: (code: MessageAttachmentCode) => void
-  onCodeCitationMouseEnter?: (index: number) => void
-  onCodeCitationMouseLeave?: (index: number) => void
-  contextInfo: ContextInfo | undefined
-  fetchingContextInfo: boolean
-  canWrapLongLines: boolean
-}
-
-const MessageMarkdownContext = createContext<MessageMarkdownContextValue>(
-  {} as MessageMarkdownContextValue
-)
 
 export function MessageMarkdown({
   message,
   headline = false,
   attachmentDocs,
+  attachmentClientCode,
   attachmentCode,
   onApplyInEditor,
   onCopyContent,
@@ -101,21 +97,35 @@ export function MessageMarkdown({
   fetchingContextInfo,
   className,
   canWrapLongLines,
+  onLookupSymbol,
+  openInEditor,
+  supportsOnApplyInEditorV2,
+  activeSelection,
   ...rest
 }: MessageMarkdownProps) {
+  const [symbolPositionMap, setSymbolLocationMap] = useState<
+    Map<string, SymbolInfo | undefined>
+  >(new Map())
   const messageAttachments: MessageAttachments = useMemo(() => {
     const docs: MessageAttachments =
       attachmentDocs?.map(item => ({
         type: 'doc',
         data: item
       })) ?? []
+
+    const clientCode: MessageAttachments =
+      attachmentClientCode?.map(item => ({
+        type: 'code',
+        data: item
+      })) ?? []
+
     const code: MessageAttachments =
       attachmentCode?.map(item => ({
         type: 'code',
         data: item
       })) ?? []
-    return compact([...docs, ...code])
-  }, [attachmentDocs, attachmentCode])
+    return compact([...docs, ...clientCode, ...code])
+  }, [attachmentDocs, attachmentClientCode, attachmentCode])
 
   const processMessagePlaceholder = (text: string) => {
     const elements: React.ReactNode[] = []
@@ -159,11 +169,61 @@ export function MessageMarkdown({
       const className = headline ? 'text-[1rem] font-semibold' : undefined
       return { sourceId, className }
     })
+    processMatches(MARKDOWN_FILE_REGEX, FileTag, (match: string) => {
+      const encodedFilepath = match[1]
+      try {
+        return {
+          encodedFilepath,
+          openInEditor
+        }
+      } catch (e) {}
+    })
 
     addTextNode(text.slice(lastIndex))
 
     return elements
   }
+
+  const lookupSymbol = async (keyword: string) => {
+    if (!onLookupSymbol) return
+    if (symbolPositionMap.has(keyword)) return
+
+    setSymbolLocationMap(map => new Map(map.set(keyword, undefined)))
+    const hints: LookupSymbolHint[] = []
+    if (activeSelection && activeSelection?.range) {
+      // FIXME(@icycodes): this is intended to convert the filepath to Filepath type
+      // We should remove this after FileContext.filepath use type Filepath instead of string
+      let filepath: Filepath
+      if (
+        activeSelection.git_url.length > 1 &&
+        !activeSelection.filepath.includes(':')
+      ) {
+        filepath = {
+          kind: 'git',
+          filepath: activeSelection.filepath,
+          gitUrl: activeSelection.git_url
+        }
+      } else {
+        filepath = {
+          kind: 'uri',
+          uri: activeSelection.filepath
+        }
+      }
+      hints.push({
+        filepath,
+        location: {
+          start: activeSelection.range.start,
+          end: activeSelection.range.end
+        }
+      })
+    }
+    const symbolInfo = await onLookupSymbol(keyword, hints)
+    setSymbolLocationMap(map => new Map(map.set(keyword, symbolInfo)))
+  }
+
+  const encodedMessage = useMemo(() => {
+    return encodeMentionPlaceHolder(message)
+  }, [message])
 
   return (
     <MessageMarkdownContext.Provider
@@ -175,12 +235,20 @@ export function MessageMarkdown({
         onCodeCitationMouseLeave: rest.onCodeCitationMouseLeave,
         contextInfo,
         fetchingContextInfo: !!fetchingContextInfo,
-        canWrapLongLines: !!canWrapLongLines
+        canWrapLongLines: !!canWrapLongLines,
+        supportsOnApplyInEditorV2,
+        activeSelection,
+        symbolPositionMap,
+        lookupSymbol: onLookupSymbol ? lookupSymbol : undefined,
+        openInEditor
       }}
     >
       <MemoizedReactMarkdown
         className={cn(
           'message-markdown prose max-w-none break-words dark:prose-invert prose-p:leading-relaxed prose-pre:mt-1 prose-pre:p-0',
+          {
+            'cursor-default': !!onApplyInEditor
+          },
           className
         )}
         remarkPlugins={[remarkGfm, remarkMath]}
@@ -206,7 +274,6 @@ export function MessageMarkdown({
                     if (typeof childrenItem === 'string') {
                       return processMessagePlaceholder(childrenItem)
                     }
-
                     return <span key={index}>{childrenItem}</span>
                   })}
                 </li>
@@ -215,41 +282,20 @@ export function MessageMarkdown({
             return <li>{children}</li>
           },
           code({ node, inline, className, children, ...props }) {
-            if (children.length) {
-              if (children[0] == '▍') {
-                return (
-                  <span className="mt-1 animate-pulse cursor-default">▍</span>
-                )
-              }
-
-              children[0] = (children[0] as string).replace('`▍`', '▍')
-            }
-
-            const match = /language-(\w+)/.exec(className || '')
-
-            if (inline) {
-              return (
-                <code className={className} {...props}>
-                  {children}
-                </code>
-              )
-            }
-
             return (
-              <CodeBlockWrapper
-                key={Math.random()}
-                language={(match && match[1]) || ''}
-                value={String(children).replace(/\n$/, '')}
-                onApplyInEditor={onApplyInEditor}
-                onCopyContent={onCopyContent}
-                canWrapLongLines={canWrapLongLines}
+              <CodeElement
+                node={node}
+                inline={inline}
+                className={className}
                 {...props}
-              />
+              >
+                {children}
+              </CodeElement>
             )
           }
         }}
       >
-        {message}
+        {encodedMessage}
       </MemoizedReactMarkdown>
     </MessageMarkdownContext.Provider>
   )
@@ -289,12 +335,6 @@ export function ErrorMessageBlock({
       {errorMessage}
     </MemoizedReactMarkdown>
   )
-}
-
-function CodeBlockWrapper(props: CodeBlockProps) {
-  const { canWrapLongLines } = useContext(MessageMarkdownContext)
-
-  return <CodeBlock {...props} canWrapLongLines={canWrapLongLines} />
 }
 
 function CitationTag({
@@ -357,17 +397,67 @@ function SourceTag({
   )
 }
 
+function FileTag({
+  encodedFilepath,
+  openInEditor,
+  className
+}: {
+  encodedFilepath: string | undefined
+  className?: string
+  openInEditor?: MessageMarkdownProps['openInEditor']
+}) {
+  const filepath = useMemo(() => {
+    if (!encodedFilepath) return null
+    try {
+      const decodedFilepath = decodeURIComponent(encodedFilepath)
+      const filepath = JSON.parse(decodedFilepath) as Filepath
+      return filepath
+    } catch (e) {
+      return null
+    }
+  }, [encodedFilepath])
+
+  const filepathString = useMemo(() => {
+    if (!filepath) return undefined
+
+    return convertFilepath(filepath).filepath
+  }, [filepath])
+
+  const handleClick = () => {
+    if (!openInEditor || !filepath) return
+    openInEditor({ filepath })
+  }
+
+  if (!filepathString) return null
+
+  return (
+    <span
+      className={cn(
+        'symbol space-x-1 whitespace-nowrap border bg-muted py-0.5 align-middle leading-5',
+        className,
+        {
+          'hover:bg-muted/50 cursor-pointer': !!openInEditor && !!filepath
+        }
+      )}
+      onClick={handleClick}
+    >
+      <IconFile className="relative -top-px inline-block h-3.5 w-3.5" />
+      <span className={cn('whitespace-normal font-medium')}>
+        {resolveFileNameForDisplay(filepathString)}
+      </span>
+    </span>
+  )
+}
+
 function RelevantDocumentBadge({
   relevantDocument,
   citationIndex
 }: {
-  relevantDocument: MessageAttachmentDoc
+  relevantDocument: AttachmentDocItem
   citationIndex: number
 }) {
-  const sourceUrl = relevantDocument ? new URL(relevantDocument.link) : null
-
   return (
-    <HoverCard>
+    <HoverCard openDelay={100} closeDelay={100}>
       <HoverCardTrigger>
         <span
           className="relative -top-2 mr-0.5 inline-block h-4 w-4 cursor-pointer rounded-full bg-muted text-center text-xs font-medium"
@@ -376,25 +466,8 @@ function RelevantDocumentBadge({
           {citationIndex}
         </span>
       </HoverCardTrigger>
-      <HoverCardContent className="w-96 text-sm">
-        <div className="flex w-full flex-col gap-y-1">
-          <div className="m-0 flex items-center space-x-1 text-xs leading-none text-muted-foreground">
-            <SiteFavicon
-              hostname={sourceUrl!.hostname}
-              className="m-0 mr-1 leading-none"
-            />
-            <p className="m-0 leading-none">{sourceUrl!.hostname}</p>
-          </div>
-          <p
-            className="m-0 cursor-pointer font-bold leading-none transition-opacity hover:opacity-70"
-            onClick={() => window.open(relevantDocument.link)}
-          >
-            {relevantDocument.title}
-          </p>
-          <p className="m-0 line-clamp-4 leading-none">
-            {normalizedText(relevantDocument.content)}
-          </p>
-        </div>
+      <HoverCardContent className="w-96 bg-background text-sm text-foreground dark:border-muted-foreground/60">
+        <DocDetailView relevantDocument={relevantDocument} />
       </HoverCardContent>
     </HoverCard>
   )
@@ -404,7 +477,7 @@ function RelevantCodeBadge({
   relevantCode,
   citationIndex
 }: {
-  relevantCode: MessageAttachmentCode
+  relevantCode: AttachmentCodeItem
   citationIndex: number
 }) {
   const {
@@ -428,48 +501,5 @@ function RelevantCodeBadge({
     >
       {citationIndex}
     </span>
-  )
-}
-
-export function SiteFavicon({
-  hostname,
-  className
-}: {
-  hostname: string
-  className?: string
-}) {
-  const [isLoaded, setIsLoaded] = useState(false)
-
-  const handleImageLoad = () => {
-    setIsLoaded(true)
-  }
-
-  return (
-    <div className="relative h-3.5 w-3.5">
-      <Image
-        src={defaultFavicon}
-        alt={hostname}
-        width={14}
-        height={14}
-        className={cn(
-          'absolute left-0 top-0 z-0 h-3.5 w-3.5 rounded-full leading-none',
-          className
-        )}
-      />
-      <Image
-        src={`https://s2.googleusercontent.com/s2/favicons?sz=128&domain_url=${hostname}`}
-        alt={hostname}
-        width={14}
-        height={14}
-        className={cn(
-          'relative z-10 h-3.5 w-3.5 rounded-full bg-card leading-none',
-          className,
-          {
-            'opacity-0': !isLoaded
-          }
-        )}
-        onLoad={handleImageLoad}
-      />
-    </div>
   )
 }

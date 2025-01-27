@@ -133,7 +133,7 @@ class InlineCompletionService(private val project: Project) : Disposable {
     messageBusConnection.subscribe(SettingsService.Listener.TOPIC, object : SettingsService.Listener {
       override fun settingsChanged(settings: SettingsService.Settings) {
         logger.debug("TriggerMode updated: ${settings.completionTriggerMode}")
-        shouldAutoTrigger = triggerMode == SettingsState.TriggerMode.AUTOMATIC
+        shouldAutoTrigger = settings.completionTriggerMode == SettingsState.TriggerMode.AUTOMATIC
       }
     })
     messageBusConnection.subscribe(DocumentListener.TOPIC, object : DocumentListener {
@@ -233,7 +233,12 @@ class InlineCompletionService(private val project: Project) : Disposable {
       val server = getServer() ?: return@launch
       logger.debug("Request inline completion: $params")
       project.safeSyncPublisher(Listener.TOPIC)?.loadingStateChanged(true)
-      val inlineCompletionList = server.textDocumentFeature.inlineCompletion(params).await()
+      val inlineCompletionList = try {
+        server.textDocumentFeature.inlineCompletion(params).await()
+      } catch (e: Exception) {
+        logger.warn("Error while requesting inline completion", e)
+        null
+      }
       val context = current
       if (requestContext == context?.request) {
         logger.debug("Request inline completion done: $inlineCompletionList")
@@ -426,6 +431,10 @@ class InlineCompletionService(private val project: Project) : Disposable {
     messageBusConnection.dispose()
   }
 
+  /**
+   * @deprecated
+   * This is not used anymore and should be removed.
+   */
   interface Listener {
     fun loadingStateChanged(loading: Boolean) {}
 

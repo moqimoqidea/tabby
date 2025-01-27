@@ -23,15 +23,20 @@ import {
   GitRepositoriesQueryVariables,
   ListIntegrationsQueryVariables,
   ListInvitationsQueryVariables,
+  ListThreadsQueryVariables,
+  NotificationsQueryVariables,
   SourceIdAccessPoliciesQueryVariables,
   UpsertUserGroupMembershipInput
 } from '../gql/generates/graphql'
+import { ExtendedCombinedError } from '../types'
 import { refreshTokenMutation } from './auth'
 import {
   listIntegrations,
   listInvitations,
   listRepositories,
   listSourceIdAccessPolicies,
+  listThreads,
+  notificationsQuery,
   userGroupsQuery
 } from './query'
 import {
@@ -88,8 +93,10 @@ function useMutation<TResult, TVariables extends AnyVariables>(
   return fn
 }
 
-function makeFormErrorHandler<T extends FieldValues>(form: UseFormReturn<T>) {
-  return (err: CombinedError) => {
+export function makeFormErrorHandler<T extends FieldValues>(
+  form: UseFormReturn<T>
+) {
+  return (err: ExtendedCombinedError) => {
     const { graphQLErrors = [] } = err
     for (const error of graphQLErrors) {
       if (error.extensions && error.extensions['validation-errors']) {
@@ -127,14 +134,16 @@ const client = new Client({
         MessageAttachment: () => null,
         MessageAttachmentCode: () => null,
         MessageAttachmentDoc: () => null,
-        NetworkSetting: () => null
+        NetworkSetting: () => null,
+        ContextInfo: () => null
       },
       resolvers: {
         Query: {
           invitations: relayPagination(),
           gitRepositories: relayPagination(),
           webCrawlerUrls: relayPagination(),
-          integrations: relayPagination()
+          integrations: relayPagination(),
+          threads: relayPagination()
         }
       },
       updates: {
@@ -364,6 +373,87 @@ const client = new Client({
                           data.sourceIdAccessPolicies.read.filter(
                             o => o.id !== userGroupId
                           )
+                      }
+                      return data
+                    }
+                  )
+                })
+            }
+          },
+          deleteThread(result, args, cache, info) {
+            if (result.deleteThread) {
+              cache
+                .inspectFields('Query')
+                // Update the cache within the thread-feeds only
+                .filter(
+                  field =>
+                    field.fieldName === 'threads' && !field.arguments?.ids
+                )
+                .forEach(field => {
+                  cache.updateQuery(
+                    {
+                      query: listThreads,
+                      variables: field.arguments as ListThreadsQueryVariables
+                    },
+                    data => {
+                      if (data?.threads) {
+                        data.threads.edges = data.threads.edges.filter(
+                          e => e.node.id !== args.id
+                        )
+                      }
+                      return data
+                    }
+                  )
+                })
+            }
+          },
+          setThreadPersisted(result, args, cache, info) {
+            if (result.setThreadPersisted) {
+              const key = 'Query'
+              cache
+                .inspectFields(key)
+                .filter(field => {
+                  return (
+                    field.fieldName === 'threads' &&
+                    !field.arguments?.ids &&
+                    !!field.arguments?.before
+                  )
+                })
+                .forEach(field => {
+                  cache.invalidate(key, field.fieldName, field.arguments)
+                })
+            }
+          },
+          markNotificationsRead(result, args, cache) {
+            if (result.markNotificationsRead) {
+              cache
+                .inspectFields('Query')
+                .filter(field => field.fieldName === 'notifications')
+                .forEach(field => {
+                  cache.updateQuery(
+                    {
+                      query: notificationsQuery,
+                      variables: field.arguments as NotificationsQueryVariables
+                    },
+                    data => {
+                      if (data?.notifications) {
+                        const isMarkAllAsRead = !args.notificationId
+                        data.notifications = data.notifications.map(item => {
+                          if (isMarkAllAsRead) {
+                            return {
+                              ...item,
+                              read: true
+                            }
+                          } else {
+                            if (item.id === args.notificationId) {
+                              return {
+                                ...item,
+                                read: true
+                              }
+                            }
+                            return item
+                          }
+                        })
                       }
                       return data
                     }

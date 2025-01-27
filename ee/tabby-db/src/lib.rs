@@ -8,14 +8,17 @@ pub use email_setting::EmailSettingDAO;
 pub use integrations::IntegrationDAO;
 pub use invitations::InvitationDAO;
 pub use job_runs::JobRunDAO;
+pub use ldap_credential::LdapCredentialDAO;
+pub use notifications::NotificationDAO;
 pub use oauth_credential::OAuthCredentialDAO;
 pub use provided_repositories::ProvidedRepositoryDAO;
 pub use repositories::RepositoryDAO;
 pub use server_setting::ServerSettingDAO;
 use sqlx::{query, query_scalar, sqlite::SqliteQueryResult, Pool, Sqlite, SqlitePool};
 pub use threads::{
-    ThreadDAO, ThreadMessageAttachmentClientCode, ThreadMessageAttachmentCode,
-    ThreadMessageAttachmentDoc, ThreadMessageDAO,
+    ThreadDAO, ThreadMessageAttachmentAuthor, ThreadMessageAttachmentClientCode,
+    ThreadMessageAttachmentCode, ThreadMessageAttachmentDoc, ThreadMessageAttachmentIssueDoc,
+    ThreadMessageAttachmentPullDoc, ThreadMessageAttachmentWebDoc, ThreadMessageDAO,
 };
 use tokio::sync::Mutex;
 use user_completions::UserCompletionDailyStatsDAO;
@@ -30,8 +33,10 @@ mod email_setting;
 mod integrations;
 mod invitations;
 mod job_runs;
+mod ldap_credential;
 #[cfg(test)]
 mod migration_tests;
+mod notifications;
 mod oauth_credential;
 mod password_reset;
 mod provided_repositories;
@@ -148,12 +153,17 @@ impl DbConn {
 
     pub async fn new(db_file: &Path) -> Result<Self> {
         tokio::fs::create_dir_all(db_file.parent().unwrap()).await?;
-        Self::backup_db(db_file).await?;
 
         let options = SqliteConnectOptions::new()
+            // Reduce SQLITE_BUSY (code 5) errors. Note that the error message "database is locked" should not be confused with SQLITE_LOCKED.
+            // For more details, see:
+            // 1. https://til.simonwillison.net/sqlite/enabling-wal-mode
+            // 2. https://www.sqlite.org/wal.html
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
             .filename(db_file)
             .create_if_missing(true);
         let pool = SqlitePool::connect_with(options).await?;
+        Self::backup_db(db_file, &pool).await?;
         Self::init_db(pool).await
     }
 
@@ -161,7 +171,19 @@ impl DbConn {
     /// backup format:
     /// for prod - db.backup-${date}.sqlite
     /// for non-prod - dev-db.backup-${date}.sqlite
-    async fn backup_db(db_file: &Path) -> Result<()> {
+    async fn backup_db(db_file: &Path, pool: &SqlitePool) -> Result<()> {
+        use sqlx_migrate_validate::Validate;
+
+        let mut conn = pool.acquire().await?;
+        if sqlx::migrate!("./migrations")
+            .validate(&mut *conn)
+            .await
+            .is_ok()
+        {
+            // No migration is needed, skip the backup.
+            return Ok(());
+        }
+
         if !tokio::fs::try_exists(db_file).await? {
             return Ok(());
         }

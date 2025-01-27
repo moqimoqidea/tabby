@@ -26,6 +26,7 @@ import {
   isUnauthorizedError,
   isCanceledError,
   isTimeoutError,
+  isRateLimitExceededError,
 } from "../utils/error";
 import { RequestStats } from "./statistics";
 
@@ -48,6 +49,7 @@ export class TabbyApiClient extends EventEmitter {
 
   private readonly completionRequestStats = new RequestStats();
   private completionResponseIssue: "highTimeoutRate" | "slowResponseTime" | undefined = undefined;
+  private rateLimitExceeded: boolean = false;
 
   private connectionErrorMessage: string | undefined = undefined;
   private serverHealth: TabbyApiComponents["schemas"]["HealthState"] | undefined = undefined;
@@ -74,12 +76,7 @@ export class TabbyApiClient extends EventEmitter {
       );
       if (isServerConnectionChanged) {
         this.logger.debug("Server configurations updated, reconnecting...");
-        this.updateStatus("noConnection");
-        this.updateCompletionResponseIssue(undefined);
-        this.connectionErrorMessage = undefined;
-        this.serverHealth = undefined;
-        this.completionRequestStats.reset();
-        this.api = this.createApiClient();
+        this.reset();
         this.connect(); // no await
       }
     });
@@ -97,6 +94,15 @@ export class TabbyApiClient extends EventEmitter {
     if (this.reconnectTimer) {
       clearInterval(this.reconnectTimer);
     }
+  }
+
+  private reset() {
+    this.updateStatus("noConnection");
+    this.updateCompletionResponseIssue(undefined);
+    this.connectionErrorMessage = undefined;
+    this.serverHealth = undefined;
+    this.completionRequestStats.reset();
+    this.api = this.createApiClient();
   }
 
   private buildUserAgentString(clientInfo: ClientInfo | undefined): string {
@@ -154,6 +160,7 @@ export class TabbyApiClient extends EventEmitter {
     }
   }
 
+  // FIXME(icycodes): move fetchingCompletion status to completion provider
   private updateIsFetchingCompletion(isFetchingCompletion: boolean) {
     if (this.fetchingCompletion != isFetchingCompletion) {
       this.fetchingCompletion = isFetchingCompletion;
@@ -168,6 +175,14 @@ export class TabbyApiClient extends EventEmitter {
         this.logger.info(`Completion response issue detected: ${issue}.`);
       }
       this.emit("hasCompletionResponseTimeIssueUpdated", !!issue);
+    }
+  }
+
+  private updateIsRateLimitExceeded(isRateLimitExceeded: boolean) {
+    if (this.rateLimitExceeded != isRateLimitExceeded) {
+      this.logger.debug(`updateIsRateLimitExceeded: ${isRateLimitExceeded}`);
+      this.rateLimitExceeded = isRateLimitExceeded;
+      this.emit("isRateLimitExceededUpdated", isRateLimitExceeded);
     }
   }
 
@@ -209,6 +224,10 @@ export class TabbyApiClient extends EventEmitter {
     return !!this.completionResponseIssue;
   }
 
+  isRateLimitExceeded(): boolean {
+    return this.rateLimitExceeded;
+  }
+
   getServerHealth(): TabbyApiComponents["schemas"]["HealthState"] | undefined {
     return this.serverHealth;
   }
@@ -223,7 +242,10 @@ export class TabbyApiClient extends EventEmitter {
     return !!(health && health["chat_model"]);
   }
 
-  async connect(): Promise<void> {
+  async connect(options: { reset?: boolean } = {}): Promise<void> {
+    if (options.reset) {
+      this.reset();
+    }
     await this.healthCheck();
     if (this.status === "ready") {
       await this.updateServerProvidedConfig();
@@ -235,19 +257,16 @@ export class TabbyApiClient extends EventEmitter {
     if (this.healthCheckMutexAbortController && !this.healthCheckMutexAbortController.signal.aborted) {
       this.healthCheckMutexAbortController.abort(new MutexAbortError());
     }
-    this.healthCheckMutexAbortController = new AbortController();
+    const abortController = new AbortController();
+    this.healthCheckMutexAbortController = abortController;
+    this.updateIsConnecting(true);
 
     const requestId = uuid();
     const requestPath = "/v1/health";
     const requestDescription = `${method} ${this.endpoint + requestPath}`;
     const requestOptions = {
-      signal: abortSignalFromAnyOf([
-        signal,
-        this.healthCheckMutexAbortController?.signal,
-        this.createTimeOutAbortSignal(),
-      ]),
+      signal: abortSignalFromAnyOf([signal, abortController.signal, this.createTimeOutAbortSignal()]),
     };
-    this.updateIsConnecting(true);
     try {
       if (!this.api) {
         throw new Error("http client not initialized");
@@ -268,27 +287,31 @@ export class TabbyApiClient extends EventEmitter {
       this.serverHealth = response.data;
       this.updateStatus("ready");
     } catch (error) {
-      this.serverHealth = undefined;
-      if (error instanceof HttpError && error.status == 405 && method !== "POST") {
+      if (isCanceledError(error)) {
+        this.logger.debug(`Health check request canceled. [${requestId}]`);
+      } else if (error instanceof HttpError && error.status == 405 && method !== "POST") {
         return await this.healthCheck(signal, "POST");
       } else if (isUnauthorizedError(error)) {
+        this.serverHealth = undefined;
         this.updateStatus("unauthorized");
+      } else if (isTimeoutError(error)) {
+        this.logger.error(`Health check request timed out. [${requestId}]`, error);
+        this.serverHealth = undefined;
+        this.connectionErrorMessage = `${requestDescription} timed out.`;
+        this.updateStatus("noConnection");
       } else {
-        if (isCanceledError(error)) {
-          this.logger.debug(`Health check request canceled. [${requestId}]`);
-          this.connectionErrorMessage = `${requestDescription} canceled.`;
-        } else if (isTimeoutError(error)) {
-          this.logger.error(`Health check request timed out. [${requestId}]`, error);
-          this.connectionErrorMessage = `${requestDescription} timed out.`;
-        } else {
-          this.logger.error(`Health check request failed. [${requestId}]`, error);
-          const message = error instanceof Error ? errorToString(error) : JSON.stringify(error);
-          this.connectionErrorMessage = `${requestDescription} failed: \n${message}`;
-        }
+        this.logger.error(`Health check request failed. [${requestId}]`, error);
+        this.serverHealth = undefined;
+        const message = error instanceof Error ? errorToString(error) : JSON.stringify(error);
+        this.connectionErrorMessage = `${requestDescription} failed: \n${message}`;
         this.updateStatus("noConnection");
       }
+    } finally {
+      if (this.healthCheckMutexAbortController === abortController) {
+        this.healthCheckMutexAbortController = undefined;
+        this.updateIsConnecting(false);
+      }
     }
-    this.updateIsConnecting(false);
   }
 
   private async updateServerProvidedConfig(): Promise<void> {
@@ -361,6 +384,7 @@ export class TabbyApiClient extends EventEmitter {
       }
       this.logger.trace(`Completion response data: [${requestId}]`, response.data);
       statsData.latency = performance.now() - requestStartedAt;
+      this.updateIsRateLimitExceeded(false);
       return response.data;
     } catch (error) {
       this.updateIsFetchingCompletion(false);
@@ -373,10 +397,16 @@ export class TabbyApiClient extends EventEmitter {
       } else if (isUnauthorizedError(error)) {
         this.logger.debug(`Completion request failed due to unauthorized. [${requestId}]`);
         statsData.notAvailable = true;
+        this.updateIsRateLimitExceeded(false);
         this.connect(); // schedule a reconnection
+      } else if (isRateLimitExceededError(error)) {
+        this.logger.debug(`Completion request failed due to rate limiting. [${requestId}]`);
+        statsData.notAvailable = true;
+        this.updateIsRateLimitExceeded(true);
       } else {
         this.logger.error(`Completion request failed. [${requestId}]`, error);
         statsData.notAvailable = true;
+        this.updateIsRateLimitExceeded(false);
         this.connect(); // schedule a reconnection
       }
       throw error; // rethrow error
@@ -384,6 +414,7 @@ export class TabbyApiClient extends EventEmitter {
       if (!statsData.notAvailable) {
         stats?.addRequestStatsEntry(statsData);
       }
+
       if (!statsData.notAvailable && !statsData.canceled) {
         this.completionRequestStats.add(statsData.latency);
         const statsResult = this.completionRequestStats.stats();
@@ -517,7 +548,7 @@ export class TabbyApiClient extends EventEmitter {
       helpMessageForRunningLargeModelOnCPU +=
         `Your Tabby server is running model <i>${serverHealthState?.model}</i> on CPU. ` +
         "This model may be performing poorly due to its large parameter size, please consider trying smaller models or switch to GPU. " +
-        "You can find a list of recommend models in the <a href='https://tabby.tabbyml.com/'>online documentation</a>.<br/>";
+        "You can find a list of recommend models in the <a href='https://tabby.tabbyml.com/docs/'>online documentation</a>.<br/>";
     }
     let commonHelpMessage = "";
     if (helpMessageForRunningLargeModelOnCPU.length == 0) {
@@ -525,7 +556,7 @@ export class TabbyApiClient extends EventEmitter {
         serverHealthState?.model ?? ""
       }</i> may be performing poorly due to its large parameter size. `;
       commonHelpMessage +=
-        "Please consider trying smaller models. You can find a list of recommend models in the <a href='https://tabby.tabbyml.com/'>online documentation</a>.</li>";
+        "Please consider trying smaller models. You can find a list of recommend models in the <a href='https://tabby.tabbyml.com/docs/'>online documentation</a>.</li>";
     }
     const host = new URL(this.endpoint ?? "http://localhost:8080").host;
     if (!(host.startsWith("localhost") || host.startsWith("127.0.0.1") || host.startsWith("0.0.0.0"))) {

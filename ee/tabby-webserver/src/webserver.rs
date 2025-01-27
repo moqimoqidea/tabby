@@ -4,13 +4,13 @@ use axum::Router;
 use tabby_common::{
     api::{
         code::CodeSearch,
-        doc::DocSearch,
         event::{ComposedLogger, EventLogger},
+        structured_doc::DocSearch,
     },
     config::Config,
 };
 use tabby_db::DbConn;
-use tabby_inference::{ChatCompletionStream, Embedding};
+use tabby_inference::{ChatCompletionStream, CompletionStream, Embedding};
 use tabby_schema::job::JobService;
 use tracing::debug;
 
@@ -18,7 +18,8 @@ use crate::{
     path::db_file,
     routes,
     service::{
-        create_service_locator, event_logger::create_event_logger, integration, job, repository,
+        create_service_locator, event_logger::create_event_logger, integration, job,
+        new_auth_service, new_email_service, new_license_service, new_setting_service, repository,
         web_documents,
     },
 };
@@ -62,6 +63,7 @@ impl Webserver {
         ui: Router,
         code: Arc<dyn CodeSearch>,
         chat: Option<Arc<dyn ChatCompletionStream>>,
+        completion: Option<Arc<dyn CompletionStream>>,
         docsearch: Arc<dyn DocSearch>,
         serper_factory_fn: impl Fn(&str) -> Box<dyn DocSearch>,
     ) -> (Router, Router) {
@@ -87,20 +89,42 @@ impl Webserver {
             serper.is_some(),
         ));
 
+        let mail = Arc::new(
+            new_email_service(db.clone())
+                .await
+                .expect("failed to initialize mail service"),
+        );
+        let license = Arc::new(
+            new_license_service(db.clone())
+                .await
+                .expect("failed to initialize license service"),
+        );
+        let setting = Arc::new(new_setting_service(db.clone()));
+        let auth = Arc::new(new_auth_service(
+            db.clone(),
+            mail.clone(),
+            license.clone(),
+            setting.clone(),
+        ));
+
         let answer = chat.as_ref().map(|chat| {
             Arc::new(crate::service::answer::create(
                 &config.answer,
+                auth.clone(),
                 chat.clone(),
                 code.clone(),
                 docsearch.clone(),
                 context.clone(),
                 serper,
+                repository.clone(),
             ))
         });
 
-        let is_chat_enabled = chat.is_some();
         let ctx = create_service_locator(
             self.logger(),
+            auth,
+            chat.clone(),
+            completion.clone(),
             code.clone(),
             repository.clone(),
             integration.clone(),
@@ -108,9 +132,11 @@ impl Webserver {
             answer.clone(),
             context.clone(),
             web_documents.clone(),
+            mail,
+            license,
+            setting,
             self.db.clone(),
             self.embedding.clone(),
-            is_chat_enabled,
         )
         .await;
 

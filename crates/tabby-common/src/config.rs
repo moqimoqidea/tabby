@@ -1,4 +1,4 @@
-use std::{collections::HashSet, path::PathBuf};
+use std::{collections::HashSet, path::PathBuf, process};
 
 use anyhow::{anyhow, Context, Result};
 use derive_builder::Builder;
@@ -9,7 +9,7 @@ use tracing::debug;
 
 use crate::{
     api::code::CodeSearchParams,
-    languages,
+    config, languages,
     path::repositories_dir,
     terminal::{HeaderFormat, InfoMessage},
 };
@@ -65,6 +65,24 @@ impl Config {
             .print();
         }
 
+        if let Err(e) = cfg.validate_config() {
+            cfg = Default::default();
+            InfoMessage::new(
+                "Parsing config failed",
+                HeaderFormat::BoldRed,
+                &[
+                    &format!(
+                        "Warning: Could not parse the Tabby configuration at {}",
+                        crate::path::config_file().as_path().to_string_lossy()
+                    ),
+                    &format!("Reason: {e}"),
+                    "Falling back to default config, please resolve the errors and restart Tabby",
+                ],
+            )
+            .print();
+            process::exit(1);
+        }
+
         Ok(cfg)
     }
 
@@ -82,6 +100,30 @@ impl Config {
                 return Err(anyhow!("Duplicate directory in `repositories`: {}", dir));
             }
         }
+        Ok(())
+    }
+
+    fn validate_config(&self) -> Result<()> {
+        Self::validate_model_config(&self.model.completion)?;
+        Self::validate_model_config(&self.model.chat)?;
+
+        Ok(())
+    }
+
+    fn validate_model_config(model_config: &Option<ModelConfig>) -> Result<()> {
+        if let Some(config::ModelConfig::Http(completion_http_config)) = &model_config {
+            if let Some(models) = &completion_http_config.supported_models {
+                if let Some(model_name) = &completion_http_config.model_name {
+                    if !models.contains(model_name) {
+                        return Err(anyhow!(
+                            "Suppported model list does not contain model: {}",
+                            model_name
+                        ));
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 }
@@ -247,6 +289,9 @@ pub struct HttpModelConfig {
     #[builder(default)]
     pub api_key: Option<String>,
 
+    #[serde(default)]
+    pub rate_limit: RateLimit,
+
     /// Used by OpenAI style API for model name.
     #[builder(default)]
     pub model_name: Option<String>,
@@ -299,6 +344,20 @@ fn default_context_size() -> usize {
     4096
 }
 
+#[derive(Serialize, Deserialize, Builder, Debug, Clone)]
+pub struct RateLimit {
+    // The limited number of requests can be made in one minute.
+    pub request_per_minute: u64,
+}
+
+impl Default for RateLimit {
+    fn default() -> Self {
+        Self {
+            request_per_minute: 1200,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct CompletionConfig {
     #[serde(default = "default_max_input_length")]
@@ -333,9 +392,9 @@ impl Default for CompletionConfig {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct AnswerConfig {
-    #[serde(default)]
+    #[serde(default = "default_answer_code_search_params")]
     pub code_search_params: CodeSearchParams,
 
     #[serde(default = "default_presence_penalty")]
@@ -343,6 +402,26 @@ pub struct AnswerConfig {
 
     #[serde(default = "AnswerConfig::default_system_prompt")]
     pub system_prompt: String,
+}
+
+impl Default for AnswerConfig {
+    fn default() -> Self {
+        Self {
+            code_search_params: default_answer_code_search_params(),
+            presence_penalty: default_presence_penalty(),
+            system_prompt: Self::default_system_prompt(),
+        }
+    }
+}
+
+fn default_answer_code_search_params() -> CodeSearchParams {
+    CodeSearchParams {
+        min_embedding_score: 0.5,
+        min_bm25_score: -1.0,
+        min_rrf_score: -1.0,
+        num_to_return: 10,
+        num_to_score: 100,
+    }
 }
 
 impl AnswerConfig {
@@ -390,6 +469,44 @@ mod tests {
     fn it_parses_empty_config() {
         let config = serdeconv::from_toml_str::<Config>("");
         debug_assert!(config.is_ok(), "{}", config.err().unwrap());
+    }
+
+    #[test]
+    fn it_parses_invalid_model_name_config() {
+        let toml_config = r#"
+            # Completion model
+            [model.completion.http]
+            kind = "llama.cpp/completion"
+            api_endpoint = "http://localhost:8888"
+            prompt_template = "<PRE> {prefix} <SUF>{suffix} <MID>"  # Example prompt template for the CodeLlama model series.
+            supported_models = ["test"]
+            model_name = "wsxiaoys/StarCoder-1B"
+
+            # Chat model
+            [model.chat.http]
+            kind = "openai/chat"
+            api_endpoint = "http://localhost:8888"
+            supported_models = ["Qwen2-1.5B-Instruct"]
+            model_name = "Qwen2-1.5B-Instruct"
+
+            # Embedding model
+            [model.embedding.http]
+            kind = "llama.cpp/embedding"
+            api_endpoint = "http://localhost:8888"
+            model_name = "Qwen2-1.5B-Instruct"
+            "#;
+
+        let config: Config =
+            serdeconv::from_toml_str::<Config>(toml_config).expect("Failed to parse config");
+
+        if let Err(e) = Config::validate_model_config(&config.model.completion) {
+            println!("Final result: {}", e);
+        }
+
+        assert!(
+            matches!(Config::validate_model_config(&config.model.completion), Err(ref _e) if true)
+        );
+        assert!(Config::validate_model_config(&config.model.chat).is_ok());
     }
 
     #[test]

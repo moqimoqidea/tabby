@@ -8,6 +8,7 @@ pub mod integration;
 pub mod interface;
 pub mod job;
 pub mod license;
+pub mod notification;
 pub mod repository;
 pub mod setting;
 pub mod thread;
@@ -16,24 +17,42 @@ pub mod user_group;
 pub mod web_documents;
 pub mod worker;
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use access_policy::{AccessPolicyService, SourceIdAccessPolicy};
+use async_openai_alt::{
+    error::OpenAIError,
+    types::{
+        ChatCompletionRequestMessage, ChatCompletionRequestUserMessageArgs,
+        CreateChatCompletionRequestArgs,
+    },
+};
 use auth::{
-    AuthenticationService, Invitation, RefreshTokenResponse, RegisterResponse, TokenAuthResponse,
+    AuthProvider, AuthProviderKind, AuthenticationService, Invitation, LdapCredential,
+    RefreshTokenResponse, RegisterResponse, TokenAuthResponse, UpdateLdapCredentialInput,
     UserSecured,
 };
 use base64::Engine;
 use chrono::{DateTime, Utc};
 use context::{ContextInfo, ContextService};
+use futures::StreamExt;
 use interface::UserValue;
 use job::{JobRun, JobService};
 use juniper::{
-    graphql_object, graphql_subscription, graphql_value, FieldError, GraphQLObject, IntoFieldError,
-    Object, RootNode, ScalarValue, Value, ID,
+    graphql_object, graphql_subscription, graphql_value, FieldError, GraphQLEnum, GraphQLObject,
+    IntoFieldError, Object, RootNode, ScalarValue, Value, ID,
 };
+use ldap3::result::LdapError;
+use notification::NotificationService;
 use repository::RepositoryGrepOutput;
-use tabby_common::api::{code::CodeSearch, event::EventLogger};
+use strum::IntoEnumIterator;
+use tabby_common::{
+    api::{code::CodeSearch, event::EventLogger},
+    config::CompletionConfig,
+};
+use tabby_inference::{
+    ChatCompletionStream, CompletionOptionsBuilder, CompletionStream, Embedding as EmbeddingService,
+};
 use thread::{CreateThreadAndRunInput, CreateThreadRunInput, ThreadRunStream, ThreadService};
 use tracing::{error, warn};
 use user_group::{
@@ -72,6 +91,9 @@ pub trait ServiceLocator: Send + Sync {
     fn auth(&self) -> Arc<dyn AuthenticationService>;
     fn worker(&self) -> Arc<dyn WorkerService>;
     fn code(&self) -> Arc<dyn CodeSearch>;
+    fn chat(&self) -> Option<Arc<dyn ChatCompletionStream>>;
+    fn completion(&self) -> Option<Arc<dyn CompletionStream>>;
+    fn embedding(&self) -> Arc<dyn EmbeddingService>;
     fn logger(&self) -> Arc<dyn EventLogger>;
     fn job(&self) -> Arc<dyn JobService>;
     fn repository(&self) -> Arc<dyn RepositoryService>;
@@ -86,6 +108,7 @@ pub trait ServiceLocator: Send + Sync {
     fn context(&self) -> Arc<dyn ContextService>;
     fn user_group(&self) -> Arc<dyn UserGroupService>;
     fn access_policy(&self) -> Arc<dyn AccessPolicyService>;
+    fn notification(&self) -> Arc<dyn NotificationService>;
 }
 
 pub struct Context {
@@ -125,6 +148,12 @@ pub enum CoreError {
     Other(#[from] anyhow::Error),
 }
 
+impl From<LdapError> for CoreError {
+    fn from(err: LdapError) -> Self {
+        Self::Other(err.into())
+    }
+}
+
 impl<S: ScalarValue> IntoFieldError<S> for CoreError {
     fn into_field_error(self) -> FieldError<S> {
         match self {
@@ -134,6 +163,36 @@ impl<S: ScalarValue> IntoFieldError<S> for CoreError {
             }
             Self::NotFound(msg) => FieldError::new(msg, graphql_value!({"code": "NOT_FOUND"})),
             Self::InvalidInput(errors) => from_validation_errors(errors),
+            _ => self.into(),
+        }
+    }
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum TestModelConnectionError {
+    #[error("{0}")]
+    FailedToConnect(String),
+
+    #[error("Model backend is not enabled")]
+    NotEnabled,
+
+    #[error("{0}")]
+    Other(#[from] CoreError),
+}
+
+impl From<OpenAIError> for TestModelConnectionError {
+    fn from(err: OpenAIError) -> Self {
+        match err {
+            OpenAIError::ApiError(e) => Self::FailedToConnect(e.message),
+            _ => Self::FailedToConnect(err.to_string()),
+        }
+    }
+}
+
+impl<S: ScalarValue> IntoFieldError<S> for TestModelConnectionError {
+    fn into_field_error(self) -> FieldError<S> {
+        match self {
+            TestModelConnectionError::Other(err) => err.into_field_error(),
             _ => self.into(),
         }
     }
@@ -186,6 +245,19 @@ async fn check_license(ctx: &Context, license_type: &[LicenseType]) -> Result<()
     }
 
     license.ensure_valid_license()
+}
+
+#[derive(GraphQLEnum)]
+enum ModelHealthBackend {
+    Chat,
+    Completion,
+    Embedding,
+}
+
+#[derive(GraphQLObject, Debug, Clone)]
+struct ModelBackendHealthInfo {
+    /// Latency in milliseconds.
+    latency_ms: i32,
 }
 
 #[derive(Default)]
@@ -366,6 +438,29 @@ impl Query {
         Ok(RepositoryGrepOutput { files, elapsed_ms })
     }
 
+    async fn auth_providers(ctx: &Context) -> Result<Vec<AuthProvider>> {
+        let mut providers = vec![];
+
+        let auth = ctx.locator.auth();
+        for x in OAuthProvider::iter() {
+            if auth
+                .read_oauth_credential(x.clone())
+                .await
+                .is_ok_and(|x| x.is_some())
+            {
+                providers.push(x.into());
+            }
+        }
+
+        if auth.read_ldap_credential().await.is_ok_and(|x| x.is_some()) {
+            providers.push(AuthProvider {
+                kind: AuthProviderKind::Ldap,
+            });
+        }
+
+        Ok(providers)
+    }
+
     async fn oauth_credential(
         ctx: &Context,
         provider: OAuthProvider,
@@ -377,6 +472,11 @@ impl Query {
     async fn oauth_callback_url(ctx: &Context, provider: OAuthProvider) -> Result<String> {
         check_admin(ctx).await?;
         ctx.locator.auth().oauth_callback_url(provider).await
+    }
+
+    async fn ldap_credential(ctx: &Context) -> Result<Option<LdapCredential>> {
+        check_admin(ctx).await?;
+        ctx.locator.auth().read_ldap_credential().await
     }
 
     async fn server_info(ctx: &Context) -> Result<ServerInfo> {
@@ -467,13 +567,18 @@ impl Query {
         .await
     }
 
+    async fn notifications(ctx: &Context) -> Result<Vec<notification::Notification>> {
+        let user = check_user(ctx).await?;
+        ctx.locator.notification().list(&user.id).await
+    }
+
     async fn disk_usage_stats(ctx: &Context) -> Result<DiskUsageStats> {
         check_admin(ctx).await?;
         ctx.locator.analytic().disk_usage_stats().await
     }
 
     async fn repository_list(ctx: &Context) -> Result<Vec<Repository>> {
-        let user = check_user(ctx).await?;
+        let user = check_user_allow_auth_token(ctx).await?;
 
         ctx.locator
             .repository()
@@ -658,6 +763,79 @@ impl Query {
 
         Ok(SourceIdAccessPolicy { source_id, read })
     }
+
+    async fn test_model_connection(
+        ctx: &Context,
+        backend: ModelHealthBackend,
+    ) -> Result<ModelBackendHealthInfo, TestModelConnectionError> {
+        check_admin(ctx).await?;
+
+        // count request time in milliseconds
+        let start = Instant::now();
+
+        match backend {
+            ModelHealthBackend::Completion => {
+                if let Some(completion) = ctx.locator.completion() {
+                    let config = CompletionConfig::default();
+                    let options = CompletionOptionsBuilder::default()
+                        .max_decoding_tokens(config.max_decoding_tokens as i32)
+                        .max_input_length(config.max_input_length)
+                        .sampling_temperature(0.1)
+                        .seed(0)
+                        .build()
+                        .expect("Failed to build completion options");
+
+                    let (first, _) = completion
+                        .generate("def fib(n):\n", options)
+                        .await
+                        .into_future()
+                        .await;
+
+                    if first.is_some() {
+                        return Ok(ModelBackendHealthInfo {
+                            latency_ms: start.elapsed().as_millis() as i32,
+                        });
+                    }
+
+                    Err(TestModelConnectionError::FailedToConnect(
+                        "Failed to connect to the completion model".into(),
+                    ))
+                } else {
+                    Err(TestModelConnectionError::NotEnabled)
+                }
+            }
+            ModelHealthBackend::Chat => {
+                if let Some(chat) = ctx.locator.chat() {
+                    let request = CreateChatCompletionRequestArgs::default()
+                        .messages(vec![ChatCompletionRequestMessage::User(
+                            ChatCompletionRequestUserMessageArgs::default()
+                                .content("Hello, please reply in short")
+                                .build()
+                                .expect("Failed to build chat completion message"),
+                        )])
+                        .build()
+                        .expect("Failed to build chat completion request");
+                    match chat.chat(request).await {
+                        Ok(_) => Ok(ModelBackendHealthInfo {
+                            latency_ms: start.elapsed().as_millis() as i32,
+                        }),
+                        Err(e) => Err(e.into()),
+                    }
+                } else {
+                    Err(TestModelConnectionError::NotEnabled)
+                }
+            }
+            ModelHealthBackend::Embedding => {
+                let embedding = ctx.locator.embedding();
+                match embedding.embed("hello Tabby").await {
+                    Ok(_) => Ok(ModelBackendHealthInfo {
+                        latency_ms: start.elapsed().as_millis() as i32,
+                    }),
+                    Err(e) => Err(TestModelConnectionError::FailedToConnect(e.to_string())),
+                }
+            }
+        }
+    }
 }
 
 #[derive(GraphQLObject)]
@@ -834,6 +1012,22 @@ impl Mutation {
             .await
     }
 
+    async fn token_auth_ldap(
+        ctx: &Context,
+        user_id: String,
+        password: String,
+    ) -> Result<TokenAuthResponse> {
+        let input = auth::TokenAuthLdapInput {
+            user_id: &user_id,
+            password: &password,
+        };
+        input.validate()?;
+        ctx.locator
+            .auth()
+            .token_auth_ldap(&user_id, &password)
+            .await
+    }
+
     async fn verify_token(ctx: &Context, token: String) -> Result<bool> {
         ctx.locator.auth().verify_access_token(&token).await?;
         Ok(true)
@@ -852,6 +1046,16 @@ impl Mutation {
     async fn send_test_email(ctx: &Context, to: String) -> Result<bool> {
         check_admin(ctx).await?;
         ctx.locator.email().send_test(to).await?;
+        Ok(true)
+    }
+
+    async fn mark_notifications_read(ctx: &Context, notification_id: Option<ID>) -> Result<bool> {
+        let user = check_user(ctx).await?;
+
+        ctx.locator
+            .notification()
+            .mark_read(&user.id, notification_id.as_ref())
+            .await?;
         Ok(true)
     }
 
@@ -904,6 +1108,31 @@ impl Mutation {
     async fn delete_oauth_credential(ctx: &Context, provider: OAuthProvider) -> Result<bool> {
         check_admin(ctx).await?;
         ctx.locator.auth().delete_oauth_credential(provider).await?;
+        Ok(true)
+    }
+
+    async fn test_ldap_connection(ctx: &Context, input: UpdateLdapCredentialInput) -> Result<bool> {
+        check_admin(ctx).await?;
+        check_license(ctx, &[LicenseType::Enterprise]).await?;
+        ctx.locator.auth().test_ldap_connection(input).await?;
+        Ok(true)
+    }
+
+    async fn update_ldap_credential(
+        ctx: &Context,
+        input: UpdateLdapCredentialInput,
+    ) -> Result<bool> {
+        check_admin(ctx).await?;
+        check_license(ctx, &[LicenseType::Enterprise]).await?;
+        input.validate()?;
+
+        ctx.locator.auth().update_ldap_credential(input).await?;
+        Ok(true)
+    }
+
+    async fn delete_ldap_credential(ctx: &Context) -> Result<bool> {
+        check_admin(ctx).await?;
+        ctx.locator.auth().delete_ldap_credential().await?;
         Ok(true)
     }
 
@@ -1030,9 +1259,22 @@ impl Mutation {
         Ok(true)
     }
 
+    async fn delete_thread(ctx: &Context, id: ID) -> Result<bool> {
+        let user = check_user_allow_auth_token(ctx).await?;
+        let svc = ctx.locator.thread();
+        let Some(thread) = svc.get(&id).await? else {
+            return Err(CoreError::NotFound("Thread not found"));
+        };
+
+        user.policy.check_delete_thread(&thread.user_id)?;
+
+        ctx.locator.thread().delete(&id).await?;
+        Ok(true)
+    }
+
     /// Turn on persisted status for a thread.
     async fn set_thread_persisted(ctx: &Context, thread_id: ID) -> Result<bool> {
-        let user = check_user(ctx).await?;
+        let user = check_user_allow_auth_token(ctx).await?;
         let svc = ctx.locator.thread();
         let Some(thread) = svc.get(&thread_id).await? else {
             return Err(CoreError::NotFound("Thread not found"));
@@ -1042,6 +1284,24 @@ impl Mutation {
             .check_update_thread_persistence(&thread.user_id)?;
 
         ctx.locator.thread().set_persisted(&thread_id).await?;
+        Ok(true)
+    }
+
+    async fn update_thread_message(
+        ctx: &Context,
+        input: thread::UpdateMessageInput,
+    ) -> Result<bool> {
+        let user = check_user(ctx).await?;
+        input.validate()?;
+
+        let svc = ctx.locator.thread();
+        let Some(thread) = svc.get(&input.thread_id).await? else {
+            return Err(CoreError::NotFound("Thread not found"));
+        };
+
+        user.policy.check_update_thread_message(&thread.user_id)?;
+
+        svc.update_thread_message(&input).await?;
         Ok(true)
     }
 
@@ -1154,19 +1414,10 @@ fn from_validation_errors<S: ScalarValue>(error: ValidationErrors) -> FieldError
 
     error.errors().iter().for_each(|(field, kind)| match kind {
         validator::ValidationErrorsKind::Struct(e) => {
-            for (_, error) in e.0.iter() {
-                if let validator::ValidationErrorsKind::Field(field_errors) = error {
-                    for error in field_errors {
-                        let mut obj = Object::with_capacity(2);
-                        obj.add_field("path", Value::scalar(field.to_string()));
-                        obj.add_field(
-                            "message",
-                            Value::scalar(error.message.clone().unwrap_or_default().to_string()),
-                        );
-                        errors.push(obj.into());
-                    }
-                }
-            }
+            let mut obj = Object::with_capacity(2);
+            obj.add_field("path", field.to_string().into());
+            obj.add_field("message", Value::scalar(e.to_string()));
+            errors.push(obj.into());
         }
         validator::ValidationErrorsKind::List(_) => {
             warn!("List errors are not handled");
